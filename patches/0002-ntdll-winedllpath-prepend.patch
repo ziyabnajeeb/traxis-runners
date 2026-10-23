@@ -1,0 +1,41 @@
+Subject: ntdll: Add WINEDLLPATH_PREPEND, searched before the builtin DLLs
+
+WINEDLLPATH folders are searched after Wine's own DLL folder, so they
+cannot replace a builtin such as d3d11.dll. Traxis needs to choose a
+graphics backend per launch (e.g. DXMT's d3d11/dxgi instead of
+wined3d's) without changing the runner for every bottle.
+
+WINEDLLPATH_PREPEND takes the same colon-separated list, using the same
+<folder>/<arch>-windows layout, and is searched first. Unset, nothing
+changes.
+
+CodeWeavers' "CW Hack 24067" (prepend_dll_path) serves a similar
+purpose but has no caller in the open-source tree.
+
+--- a/dlls/ntdll/unix/loader.c	2026-10-20 20:56:08
++++ b/dlls/ntdll/unix/loader.c	2026-10-20 20:56:08
+@@ -386,14 +386,23 @@
+ 
+ static void set_dll_path(void)
+ {
+-    char *p, *path = getenv( "WINEDLLPATH" );
++    char *p, *path = getenv( "WINEDLLPATH" ), *prepend = getenv( "WINEDLLPATH_PREPEND" );
+     int i, count = 0;
+ 
+     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
++    if (prepend) for (p = prepend, count++; *p; p++) if (*p == ':') count++;
+ 
+     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
+     count = 0;
+ 
++    /* Traxis: searched before Wine's own builtins, to swap in e.g. DXMT per launch. */
++    if (prepend)
++    {
++        prepend = strdup( prepend );
++        for (p = strtok( prepend, ":" ); p; p = strtok( NULL, ":" )) dll_paths[count++] = strdup( p );
++        free( prepend );
++    }
++
+     if (!build_dir) dll_paths[count++] = dll_dir;
+ 
+     if (path)

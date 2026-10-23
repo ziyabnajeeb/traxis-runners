@@ -1,0 +1,34 @@
+Subject: win32u: Build without Vulkan when MoltenVK is not available
+
+CodeWeavers' "CW HACK 25909" in vulkan_init_once() uses SONAME_LIBVULKAN
+unconditionally. configure only defines it when libvulkan or MoltenVK is
+found, so a build without MoltenVK fails to compile. Upstream Wine guards
+the same code with #ifdef SONAME_LIBVULKAN.
+
+Fall back to "no Vulkan" (or CX_LIBVULKAN, if set) instead.
+
+Drop this patch once runners always build with MoltenVK, or once
+CodeWeavers adds the guard.
+
+--- a/dlls/win32u/vulkan.c	2026-10-20 00:35:38
++++ b/dlls/win32u/vulkan.c	2026-10-20 00:35:38
+@@ -3006,9 +3006,19 @@
+     if (!(libvulkan = getenv( "CX_LIBVULKAN" )) ||
+         !(graphics_backend = getenv( "CX_ACTIVE_GRAPHICS_BACKEND" )) ||
+         strcmp( graphics_backend, "wined3d" ))
++#ifdef SONAME_LIBVULKAN
+         libvulkan = SONAME_LIBVULKAN;
++#else
++        libvulkan = NULL;
++#endif
+     else
+         ERR( "Using %s\n", libvulkan );
++
++    if (!libvulkan)
++    {
++        WARN( "Vulkan support was not built in\n" );
++        return;
++    }
+ 
+     if (!(vulkan_handle = dlopen( libvulkan, RTLD_NOW )))
+     {

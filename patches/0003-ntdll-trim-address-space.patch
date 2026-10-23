@@ -1,0 +1,103 @@
+Subject: ntdll: Add WINE_TRIM_ADDRESS_SPACE, so no free 2 GB block exists
+
+For the 32-bit programs it names, with a 4 GB address space, ntdll
+reserves the last 64 KB below 0xffff0000 at startup. The value is "1"
+for every program, or program file names separated by ';' or ',',
+compared without case (e.g. "setup.tmp").
+
+Needed for installers built on FreeArc's unarc.dll (FitGirl and similar
+repacks). Before each block, unarc binary-searches for the largest block
+it can reserve, with lo = 0, hi = 0xFFFFFFFF and mid = (lo + hi) >> 1 in
+32-bit arithmetic (unarc.dll+0xa904). Inno Setup's <name>.tmp is large
+address aware, so in Wine it gets 4 GB with one free block of exactly
+2 GB, 0x7fff0000-0xfffeffff. The first probe succeeds there, lo + hi
+wraps, each probe shrinks, and once lo is 1 the probe size is 0 and the
+loop spins forever: extraction stuck at 0 %, one core busy (seen with
+SIFU's FitGirl repack). With the guard no 2 GB block exists, the first
+probe fails, hi stays below 2 GB and the search ends normally, while the
+program keeps 4 GB for its decompressors' large buffers.
+
+Limiting the program to 2 GB also avoids the loop, but its decompressors
+then retry 1.28 GB allocations for minutes per file. Lowering the 4 GB
+limit a little does not work: wow64 turns it into a zero_bits mask,
+which rounds it back up.
+
+Unset, nothing changes.
+
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -5097,7 +5097,39 @@
+ 
+     return result;
+ }
++
++/* Traxis (see patches/0003): whether the environment variable `var` names
++ * this program: "1" for every program, or file names such as "setup.tmp"
++ * separated by ';' or ',', compared without case. */
++static BOOL program_listed( const char *var )
++{
++    const char *e = getenv( var ), *p, *end;
++    const WCHAR *app_name;
++    size_t len, i;
++
++    if (!e || !*e || !strcmp( e, "0" )) return FALSE;
++    if (!strcmp( e, "1" )) return TRUE;
++
++    if ((app_name = ntdll_wcsrchr( main_wargv[0], '\\' ))) app_name++;
++    else app_name = main_wargv[0];
++    len = wcslen( app_name );
+ 
++    for (p = e; *p; p = *end ? end + 1 : end)
++    {
++        end = p + strcspn( p, ";," );
++        if ((size_t)(end - p) != len) continue;
++        for (i = 0; i < len; i++)
++        {
++            WCHAR a = app_name[i], b = (unsigned char)p[i];
++            if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
++            if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
++            if (a != b) break;
++        }
++        if (i == len) return TRUE;
++    }
++    return FALSE;
++}
++
+ /***********************************************************************
+  *           virtual_set_large_address_space
+  *
+@@ -5106,6 +5138,16 @@
+ void virtual_set_large_address_space(void)
+ {
+     BOOL large_address_space_active = ((main_image_info.ImageCharacteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) || force_laa());
++
++    /* Traxis: for programs WINE_TRIM_ADDRESS_SPACE names, the last 64 KB
++     * below 0xffff0000 is reserved, so no free block of 2 GB exists. Below
++     * KUSER_SHARED_DATA (0x7ffe0000) the program and its DLLs break the space
++     * up; above it 0x7fff0000 bytes are left. FreeArc's unarc.dll loops
++     * forever when it can reserve 2 GB at once. Lowering the limit instead
++     * does not work: wow64 turns it into a zero_bits mask, which rounds it
++     * back up to 4 GB. */
++    BOOL trim = program_listed( "WINE_TRIM_ADDRESS_SPACE" );
++
+     if (is_win64)
+     {
+         if (!is_wow64())
+@@ -5117,7 +5159,16 @@
+                 free_reserved_memory( 0, (char *)0x7ffe0000 );
+ #endif
+         }
+-        else user_space_wow_limit = (large_address_space_active ? limit_4g : limit_2g) - 1;
++        else
++        {
++            user_space_wow_limit = (large_address_space_active ? limit_4g : limit_2g) - 1;
++            if (trim && large_address_space_active)
++            {
++                void *guard = (void *)(limit_4g - 0x20000);
++                SIZE_T size = 0x10000;
++                NtAllocateVirtualMemory( NtCurrentProcess(), &guard, 0, &size, MEM_RESERVE, PAGE_NOACCESS );
++            }
++        }
+     }
+     else
+     {

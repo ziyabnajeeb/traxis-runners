@@ -1,0 +1,13 @@
+# Runner manifest (architecture §5.4). Filled in by scripts/package.sh.
+schema_version = 1
+id = "@ID@"
+version = "@VERSION@"
+wine = "bin/wine"
+wineserver = "bin/wineserver"
+runtimes = ["rosetta"]
+source_url = "@SOURCE_URL@"
+addons = [@ADDONS@]
+
+[env]
+# Wine loads FreeType and friends by bare name; find them in the runner itself.
+DYLD_FALLBACK_LIBRARY_PATH = "{runner}/lib:/usr/local/lib:/usr/lib"
