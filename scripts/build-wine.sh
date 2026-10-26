@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build Wine from the CodeWeavers sources into runners/build/ (git-ignored).
-# Usage: runners/scripts/build-wine.sh [deps|source|configure|build|install|addons|components|all]   (default: all)
+# Usage: runners/scripts/build-wine.sh [deps|gstreamer|source|configure|build|install|addons|components|all]   (default: all)
 # Requires runners/scripts/toolchain.sh to have run once.
 set -eu
 # Build natively, even when started from a shell running under Rosetta: Apple's
@@ -29,11 +29,12 @@ STEP=${1:-all}
 # x86_64 and run under Rosetta automatically, so configure scripts still work.
 # Xcode's clang for the Mac side, by full path (llvm-mingw has its own `clang`).
 CC="$(xcrun -f clang) -arch x86_64"
+CXX="$(xcrun -f clang++) -arch x86_64" # for GStreamer's meson checks
 OBJC=$CC
 # The /usr/bin shims normally set these; calling clang directly needs them explicit.
 SDKROOT=$(xcrun --show-sdk-path)
 MACOSX_DEPLOYMENT_TARGET=14.0 # PRD §4 minimum
-export CC OBJC SDKROOT MACOSX_DEPLOYMENT_TARGET
+export CC CXX OBJC SDKROOT MACOSX_DEPLOYMENT_TARGET
 run() { "$@"; }
 
 # Libraries Wine loads at runtime. Each one is built into $DEPS (with headers
@@ -122,25 +123,214 @@ deps_gnutls() {
     --disable-tests --disable-tools --disable-cxx --disable-nls --disable-libdane
 }
 
-# Copy $DEPS's shared libraries into the runner, named and linked by
-# @loader_path, so nothing points back into runners/build/.
+# GStreamer, for Media Foundation video and audio (winegstreamer): games play
+# their videos through it (CrossOver bundles it too). Only what Wine's
+# decoders need, all LGPL: GLib, GStreamer core and base, good's MP4/Matroska/AVI
+# demuxers and audio parsers, bad's video parsers, ugly's ASF demuxer (WMV and
+# WMA files; gst-libav leaves FFmpeg's out), and gst-libav over an
+# FFmpeg with decoders only (no GPL or nonfree parts). Checksums are the
+# publishers' (.sha256sum files); FFmpeg publishes only a GPG signature, so
+# its is the file as first downloaded over HTTPS from ffmpeg.org.
+GLIB=2.82.5
+GLIB_SHA256=05c2031f9bdf6b5aba7a06ca84f0b4aced28b19bf1b50c6ab25cc675277cbc3f
+# GLib's dependencies (its meson wraps download from wrapdb, which isn't always
+# reachable; these are the same projects' releases, checksums from their
+# release notes; proxy-libintl publishes none).
+PCRE2=10.44
+PCRE2_SHA256=d34f02e113cf7193a1ebf2770d3ac527088d485d4e047ed10e5d217c6ef5de96
+LIBFFI=3.4.6
+LIBFFI_SHA256=b0dea9df23c863a7a50e825440f3ebffabd65df1497108e5d437747843895a4e
+PROXY_LIBINTL=0.4
+PROXY_LIBINTL_SHA256=13ef3eea0a3bc0df55293be368dfbcff5a8dd5f4759280f28e030d1494a5dffb
+GST=1.24.12
+GST_SHA256=b3522d1b4fe174fff3b3c7f0603493e2367bd1c43f5804df15b634bd22b1036f
+GST_BASE_SHA256=f6efbaa8fea8d00bc380bccca76a530527b1f083e8523eafb3e9b1e18bc653d3
+GST_GOOD_SHA256=d0e66e2f935d1575f6adbef7d0a2b3faba7360344383c51bf0233b39e0489a64
+GST_BAD_SHA256=3d386af3d1dbd1a06c74a6251250c269b481e703f0e3255ba89ef6c1e063afea
+GST_UGLY_SHA256=19ed6eef4ea1a742234fb35e2cdb107168595a4dd409a9fac0b7a16543eee78b
+GST_LIBAV_SHA256=ef72c1c70a17b3c0bb283d16d09aba496d3401c927dcf5392a8a7866d9336379
+FFMPEG=7.1.1
+FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
+
+# Download (once, checked) and unpack into build/src/. Prints the source folder.
+fetch_source() { # <url> <sha256> [file name, if the URL's isn't one]
+  file=$RUNNERS/toolchain/downloads/${3:-$(basename "$1")}
+  if [ ! -f "$file" ]; then
+    curl -fsSL --retry 3 "$1" -o "$file.part" && mv "$file.part" "$file"
+  fi
+  echo "$2  $file" | shasum -a 256 -c - >/dev/null || {
+    echo "checksum mismatch for $file; delete it and retry" >&2
+    exit 1
+  }
+  src=$RUNNERS/build/src/$(basename "$file" | sed 's/\.tar\..*$//')
+  rm -rf "$src" && mkdir -p "$src"
+  tar xf "$file" -C "$src" --strip-components=1
+  echo "$src"
+}
+
+# Meson build into $DEPS; dependencies come from $DEPS only, never downloaded.
+meson_build() { # <name> <srcdir> [meson options]
+  name=$1 src=$2
+  shift 2
+  obj=$RUNNERS/build/$name-x86_64
+  rm -rf "$obj" "$obj.log"
+  PKG_CONFIG_PATH=$DEPS/lib/pkgconfig run meson setup "$obj" "$src" --prefix="$DEPS" \
+    --libdir=lib --buildtype=release -Ddefault_library=shared --wrap-mode=nofallback \
+    -Dc_args="-arch x86_64 -I$DEPS/include" -Dc_link_args="-arch x86_64 -L$DEPS/lib" \
+    -Dobjc_args="-arch x86_64 -I$DEPS/include" -Dobjc_link_args="-arch x86_64 -L$DEPS/lib" \
+    -Dcpp_args="-arch x86_64 -I$DEPS/include" -Dcpp_link_args="-arch x86_64 -L$DEPS/lib" "$@" >"$obj.log" 2>&1 &&
+    run ninja -C "$obj" install >>"$obj.log" 2>&1 || {
+    tail -30 "$obj.log" >&2
+    echo "$name failed; full log: $obj.log" >&2
+    exit 1
+  }
+  echo "built $name"
+}
+
+deps_glib() {
+  autotools_build pcre2 "$(fetch_source "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$PCRE2/pcre2-$PCRE2.tar.bz2" "$PCRE2_SHA256")" \
+    --disable-pcre2grep-jit --enable-jit
+  autotools_build libffi "$(fetch_source "https://github.com/libffi/libffi/releases/download/v$LIBFFI/libffi-$LIBFFI.tar.gz" "$LIBFFI_SHA256")" \
+    --disable-docs
+  meson_build proxy-libintl "$(fetch_source "https://github.com/frida/proxy-libintl/archive/refs/tags/$PROXY_LIBINTL.tar.gz" "$PROXY_LIBINTL_SHA256" "proxy-libintl-$PROXY_LIBINTL.tar.gz")"
+  meson_build glib "$(fetch_source "https://download.gnome.org/sources/glib/${GLIB%.*}/glib-$GLIB.tar.xz" "$GLIB_SHA256")" \
+    -Dtests=false -Dintrospection=disabled -Dnls=disabled -Dlibmount=disabled \
+    -Dselinux=disabled -Dxattr=false -Dman-pages=disabled -Ddocumentation=false \
+    -Dsysprof=disabled -Dglib_debug=disabled
+}
+
+gst_url() { echo "https://gstreamer.freedesktop.org/src/$1/$1-$GST.tar.xz"; }
+
+deps_gstreamer() {
+  # Its tools include gst-plugin-scanner, which loads plugins in a separate
+  # process (the runner bundles only that one).
+  meson_build gstreamer "$(fetch_source "$(gst_url gstreamer)" "$GST_SHA256")" \
+    -Dtests=disabled -Dexamples=disabled -Ddoc=disabled \
+    -Dintrospection=disabled -Dnls=disabled -Dbash-completion=disabled \
+    -Dlibunwind=disabled -Dlibdw=disabled -Dptp-helper=disabled -Dcheck=disabled \
+    -Dbenchmarks=disabled
+  # auto_features=disabled: only the plugins named here.
+  meson_build gst-plugins-base "$(fetch_source "$(gst_url gst-plugins-base)" "$GST_BASE_SHA256")" \
+    -Dauto_features=disabled -Dtests=disabled -Dexamples=disabled -Dtools=disabled \
+    -Ddoc=disabled -Dintrospection=disabled -Dnls=disabled \
+    -Dapp=enabled -Daudioconvert=enabled -Daudioresample=enabled -Dplayback=enabled \
+    -Dtypefind=enabled -Dvideoconvertscale=enabled -Dvolume=enabled \
+    -Doverlaycomposition=enabled
+  meson_build gst-plugins-good "$(fetch_source "$(gst_url gst-plugins-good)" "$GST_GOOD_SHA256")" \
+    -Dauto_features=disabled -Dtests=disabled -Dexamples=disabled -Ddoc=disabled -Dnls=disabled \
+    -Disomp4=enabled -Dmatroska=enabled -Davi=enabled -Daudioparsers=enabled -Dwavparse=enabled \
+    -Dautodetect=enabled -Dvideofilter=enabled -Ddeinterlace=enabled -Did3demux=enabled
+  meson_build gst-plugins-bad "$(fetch_source "$(gst_url gst-plugins-bad)" "$GST_BAD_SHA256")" \
+    -Dauto_features=disabled -Dtests=disabled -Dexamples=disabled -Ddoc=disabled -Dnls=disabled \
+    -Dtools=disabled -Dintrospection=disabled -Dgpl=disabled -Dvideoparsers=enabled
+  meson_build gst-plugins-ugly "$(fetch_source "$(gst_url gst-plugins-ugly)" "$GST_UGLY_SHA256")" \
+    -Dauto_features=disabled -Dtests=disabled -Ddoc=disabled -Dnls=disabled \
+    -Dgpl=disabled -Dasfdemux=enabled
+}
+
+# FFmpeg with decoders and parsers only, as shared libraries for gst-libav.
+deps_ffmpeg() {
+  src=$(fetch_source "https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz" "$FFMPEG_SHA256")
+  obj=$RUNNERS/build/ffmpeg-x86_64
+  rm -rf "$obj" && mkdir -p "$obj"
+  (cd "$obj" &&
+    run "$src/configure" --prefix="$DEPS" --cc="$CC" --arch=x86_64 --enable-shared \
+      --disable-static --disable-programs --disable-doc --disable-network --disable-autodetect \
+      --disable-everything --disable-iconv --disable-securetransport \
+      --disable-avdevice --disable-swscale \
+      --enable-decoder=h264,hevc,mpeg1video,mpeg2video,mpeg4,msmpeg4v3,vp8,vp9,theora,wmv1,wmv2,wmv3,vc1 \
+      --enable-decoder=aac,mp3,mp3float,mp2,vorbis,opus,flac,wmav1,wmav2,wmapro,adpcm_ms,adpcm_ima_wav \
+      --enable-decoder='pcm_*' \
+      --enable-parser=h264,hevc,mpegvideo,mpeg4video,vp8,vp9,vc1,aac,mpegaudio,vorbis,opus,flac \
+      --enable-filter=aresample,format,null,anull >"$obj.log" 2>&1 &&
+    run make -s -j"$JOBS" >>"$obj.log" 2>&1 &&
+    run make -s install >>"$obj.log" 2>&1) || {
+    tail -30 "$obj.log" >&2
+    echo "ffmpeg failed; full log: $obj.log" >&2
+    exit 1
+  }
+  echo "built ffmpeg"
+  meson_build gst-libav "$(fetch_source "$(gst_url gst-libav)" "$GST_LIBAV_SHA256")" \
+    -Dtests=disabled -Ddoc=disabled
+}
+
+# The libraries in $DEPS/lib something in the runner loads, starting from
+# what Wine loads by name or links (FreeType, GnuTLS, winegstreamer's
+# GStreamer libraries) and GStreamer's plugins, plus all they link in turn.
+# Prints their file names.
+needed_libs() {
+  todo="$DEPS/lib/libfreetype.6.dylib $DEPS/lib/libgnutls.30.dylib"
+  for lib in $(PKG_CONFIG_PATH=$DEPS/lib/pkgconfig pkg-config --libs-only-l $GST_WINE_PACKAGES); do
+    todo="$todo $(ls "$DEPS"/lib/lib"${lib#-l}".*dylib | head -1)"
+  done
+  todo="$todo $(ls "$DEPS"/lib/gstreamer-1.0/*.dylib) $DEPS/libexec/gstreamer-1.0/gst-plugin-scanner"
+  seen=""
+  for f in $todo; do
+    case $f in
+      "$DEPS"/lib/gstreamer-1.0/*) ;;
+      "$DEPS"/lib/*.dylib) seen="$seen $(basename "$(otool -D "$f" | tail -1)")" ;;
+    esac
+  done
+  while [ -n "$todo" ]; do
+    set -- $todo
+    f=$1
+    shift
+    todo="$*"
+    for dep in $(otool -L "$f" | awk 'NR > 1 { print $1 }' | grep "^$DEPS/lib/"); do
+      case " $seen " in
+        *" $(basename "$dep") "*) ;;
+        *) seen="$seen $(basename "$dep")" todo="$todo $dep" ;;
+      esac
+    done
+  done
+  echo $seen | tr ' ' '\n' | sort -u
+}
+GST_WINE_PACKAGES="gstreamer-1.0 gstreamer-video-1.0 gstreamer-audio-1.0 gstreamer-tag-1.0"
+
+# Copy those libraries into the runner, named and linked by @loader_path, so
+# nothing points back into runners/build/.
 bundle_libs() {
   mkdir -p "$DIST/lib"
-  for lib in "$DEPS"/lib/*.dylib; do
-    [ -L "$lib" ] && continue
-    leaf=$(basename "$(otool -D "$lib" | tail -1)")
+  for leaf in $(needed_libs); do
     out=$DIST/lib/$leaf
-    cp "$lib" "$out" && chmod u+w "$out"
+    cp "$DEPS/lib/$leaf" "$out" && chmod u+w "$out"
     install_name_tool -id "@loader_path/$leaf" "$out"
-    otool -L "$out" | awk 'NR > 1 { print $1 }' | grep "^$DEPS/lib/" | while read -r dep; do
-      install_name_tool -change "$dep" "@loader_path/$(basename "$dep")" "$out"
-    done
-    codesign --force --sign - "$out" 2>/dev/null
+    relink "$out" @loader_path
     echo "bundled $leaf"
   done
 }
 
-deps() { deps_freetype && deps_gnutls && bundle_libs; }
+# GStreamer's plugins and plugin scanner, linked to the libraries bundle_libs
+# put in lib/. runner.toml's [env] tells GStreamer where they are.
+bundle_gstreamer() {
+  rm -rf "$DIST/lib/gstreamer-1.0" "$DIST/libexec/gstreamer-1.0"
+  mkdir -p "$DIST/lib/gstreamer-1.0" "$DIST/libexec/gstreamer-1.0"
+  for f in "$DEPS"/lib/gstreamer-1.0/*.dylib "$DEPS/libexec/gstreamer-1.0/gst-plugin-scanner"; do
+    case $f in
+      *.dylib) out=$DIST/lib/gstreamer-1.0/$(basename "$f") to=@loader_path/.. ;;
+      *) out=$DIST/libexec/gstreamer-1.0/$(basename "$f") to=@executable_path/../../lib ;;
+    esac
+    cp "$f" "$out" && chmod u+w "$out"
+    case $f in *.dylib) install_name_tool -id "@loader_path/$(basename "$f")" "$out" ;; esac
+    relink "$out" "$to"
+  done
+  echo "bundled GStreamer $GST ($(ls "$DIST/lib/gstreamer-1.0" | wc -l | tr -d ' ') plugins)"
+}
+
+# Points `file`'s links to $DEPS/lib at `to` (e.g. @loader_path/..) instead.
+relink() { # <file> <to>
+  otool -L "$1" | awk 'NR > 1 { print $1 }' | grep "^$DEPS/lib/" | while read -r dep; do
+    install_name_tool -change "$dep" "$2/$(basename "$dep")" "$1"
+  done
+  # pkg-config's -rpath to $DEPS/lib means nothing on other Macs.
+  otool -l "$1" | grep -q "path $DEPS/lib " && install_name_tool -delete_rpath "$DEPS/lib" "$1"
+  codesign --force --sign - "$1" 2>/dev/null
+}
+
+deps() {
+  deps_freetype && deps_gnutls && deps_glib && deps_gstreamer && deps_ffmpeg &&
+    bundle_libs && bundle_gstreamer
+}
 
 
 # Copy the Wine sources (an instant clone on APFS) and apply patches/*.patch in order.
@@ -163,6 +353,8 @@ configure() {
     FREETYPE_LIBS="-L$DEPS/lib -lfreetype" \
     GNUTLS_CFLAGS="-I$DEPS/include" \
     GNUTLS_LIBS="-L$DEPS/lib -lgnutls" \
+    GSTREAMER_CFLAGS="$(PKG_CONFIG_PATH=$DEPS/lib/pkgconfig pkg-config --cflags $GST_WINE_PACKAGES)" \
+    GSTREAMER_LIBS="$(PKG_CONFIG_PATH=$DEPS/lib/pkgconfig pkg-config --libs $GST_WINE_PACKAGES)" \
     --prefix="$DIST" \
     --host=x86_64-apple-darwin \
     --enable-archs=i386,x86_64 \
@@ -199,7 +391,15 @@ addons() {
     echo "bundled $file"
   done
 }
-install() { cd "$BUILD" && run make install; }
+# Wine's Unix libraries that link bundled libraries (winegstreamer.so) find
+# them in lib/, two folders up.
+install() {
+  cd "$BUILD" && run make install
+  for so in "$DIST"/lib/wine/x86_64-unix/*.so; do
+    otool -L "$so" | grep -q "$DEPS/lib/" && relink "$so" @loader_path/../..
+  done
+  return 0
+}
 
 # DXMT (D3D10/11 -> Metal), the upstream author's release build. Building it
 # ourselves needs full Xcode with the Metal toolchain and LLVM 15
@@ -238,6 +438,8 @@ components() {
 
 case $STEP in
   deps) deps ;;
+  gstreamer) deps_glib && deps_gstreamer && deps_ffmpeg && bundle_libs && bundle_gstreamer ;;
+  bundle) bundle_libs && bundle_gstreamer ;;
   source) patch_source ;;
   configure) shift || true; configure "$@" ;;
   build) build ;;

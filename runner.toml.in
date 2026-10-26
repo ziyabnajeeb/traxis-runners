@@ -11,3 +11,9 @@ addons = [@ADDONS@]
 [env]
 # Wine loads FreeType and friends by bare name; find them in the runner itself.
 DYLD_FALLBACK_LIBRARY_PATH = "{runner}/lib:/usr/local/lib:/usr/lib"
+# GStreamer (Media Foundation video and audio) uses only the runner's plugins,
+# with its own registry cache.
+GST_PLUGIN_SYSTEM_PATH_1_0 = "{runner}/lib/gstreamer-1.0"
+GST_PLUGIN_PATH_1_0 = ""
+GST_PLUGIN_SCANNER_1_0 = "{runner}/libexec/gstreamer-1.0/gst-plugin-scanner"
+GST_REGISTRY_1_0 = "{runner}/lib/gstreamer-1.0/registry.bin"

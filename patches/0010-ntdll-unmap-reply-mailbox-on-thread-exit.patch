@@ -1,0 +1,39 @@
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -2025,6 +2025,16 @@
+     close( fd );
+     if (status) munmap( mailbox, sizeof(*mailbox) );
+     else reply_mailbox = mailbox;
++}
++
++/* Traxis (patches/0010): releases the calling thread's reply mailbox when it
++ * exits, after its last server call. The server unmaps its own mapping when
++ * the thread object goes away. */
++void server_exit_thread(void)
++{
++    if (!reply_mailbox) return;
++    munmap( reply_mailbox, sizeof(*reply_mailbox) );
++    reply_mailbox = NULL;
+ }
+ 
+ void server_init_thread( void *entry_point, BOOL *suspend )
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1109,6 +1109,7 @@
+     close( ntdll_get_thread_data()->wait_fd[1] );
+     close( ntdll_get_thread_data()->reply_fd );
+     close( ntdll_get_thread_data()->request_fd );
++    server_exit_thread();
+ 
+ #if defined(__APPLE__) && defined(__x86_64__)
+     /* Remove the PEB from the localtime field in %gs, or MacOS might try
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -248,6 +248,7 @@
+ extern size_t server_init_process(void);
+ extern void server_init_process_done(void);
+ extern void server_init_thread( void *entry_point, BOOL *suspend );
++extern void server_exit_thread(void);
+ extern int server_pipe( int fd[2] );
+ 
+ extern void fpux_to_fpu( I386_FLOATING_SAVE_AREA *fpu, const XSAVE_FORMAT *fpux );

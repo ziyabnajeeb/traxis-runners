@@ -1,0 +1,539 @@
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -1646,6 +1646,7 @@
+     FD_TYPE_SERIAL,   /* serial port */
+     FD_TYPE_CHAR,     /* unspecified char device */
+     FD_TYPE_DEVICE,   /* Windows device file */
++    FD_TYPE_PIPE,     /* anonymous pipe end backed by a Unix socket (Traxis patches/0008) */
+     FD_TYPE_NB_TYPES
+ };
+ 
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -1928,6 +1928,7 @@
+     FD_TYPE_SERIAL,
+     FD_TYPE_CHAR,
+     FD_TYPE_DEVICE,
++    FD_TYPE_PIPE,
+     FD_TYPE_NB_TYPES
+ };
+ 
+@@ -7114,6 +7115,6 @@
+     struct set_reply_mailbox_reply set_reply_mailbox_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 1810
++#define SERVER_PROTOCOL_VERSION 1811
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/file.h
++++ b/server/file.h
+@@ -95,6 +95,7 @@
+ extern unsigned int get_fd_comp_flags( struct fd *fd );
+ extern int is_fd_overlapped( struct fd *fd );
+ extern int get_unix_fd( struct fd *fd );
++extern void set_fd_unix_fd( struct fd *fd, int unix_fd );
+ extern client_ptr_t get_fd_map_address( struct fd *fd );
+ extern void set_fd_map_address( struct fd *fd, client_ptr_t addr, mem_size_t size );
+ extern int is_same_file_fd( struct fd *fd1, struct fd *fd2 );
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -2179,6 +2179,14 @@
+ {
+     if (fd->unix_fd == -1) set_error( fd->no_fd_status );
+     return fd->unix_fd;
++}
++
++/* give a pseudo fd a Unix fd that clients use directly; the server doesn't
++ * poll it, and closes it with the fd (Traxis patches/0008) */
++void set_fd_unix_fd( struct fd *fd, int unix_fd )
++{
++    assert( fd->unix_fd == -1 && !fd->inode );
++    fd->unix_fd = unix_fd;
+ }
+ 
+ /* retrieve the suggested mapping address for the fd */
+--- a/server/named_pipe.c
++++ b/server/named_pipe.c
+@@ -23,11 +23,16 @@
+ #include "config.h"
+ 
+ #include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
+ #include <string.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/types.h>
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <unistd.h>
+ 
+ #include "ntstatus.h"
+ #define WIN32_NO_STATUS
+@@ -66,6 +71,7 @@
+     struct list          message_queue;
+     struct async_queue   read_q;     /* read queue */
+     struct async_queue   write_q;    /* write queue */
++    int                  fast;       /* data goes through a Unix socket pair (patches/0008) */
+ };
+ 
+ struct pipe_server
+@@ -88,6 +94,7 @@
+     timeout_t           timeout;
+     struct list         listeners;   /* list of servers listening on this pipe */
+     struct async_queue  waiters;     /* list of clients waiting to connect */
++    int                 fast_client_sock; /* socket for the client end until it connects, or -1 */
+ };
+ 
+ struct named_pipe_device
+@@ -425,6 +432,7 @@
+     assert( list_empty( &pipe->listeners ) );
+     assert( !pipe->instances );
+     free_async_queue( &pipe->waiters );
++    if (pipe->fast_client_sock != -1) close( pipe->fast_client_sock );
+ }
+ 
+ static struct fd *pipe_end_get_fd( struct object *obj )
+@@ -753,6 +761,13 @@
+     struct pipe_message *message;
+     data_size_t avail = 0;
+ 
++    if (pipe_end->fast)
++    {
++        int unread = 0;
++        ioctl( get_unix_fd( pipe_end->fd ), FIONREAD, &unread );
++        return unread > 0 ? unread : 0;
++    }
++
+     LIST_FOR_EACH_ENTRY( message, &pipe_end->message_queue, struct pipe_message, entry )
+         avail += message->iosb->in_size - message->read_pos;
+ 
+@@ -1094,6 +1109,12 @@
+ static void pipe_end_read( struct fd *fd, struct async *async, file_pos_t pos )
+ {
+     struct pipe_end *pipe_end = get_fd_user( fd );
++
++    if (pipe_end->fast)  /* ntdll reads the socket itself */
++    {
++        set_error( STATUS_NOT_SUPPORTED );
++        return;
++    }
+ 
+     switch (pipe_end->state)
+     {
+@@ -1127,6 +1148,12 @@
+     struct pipe_message *message;
+     struct iosb *iosb;
+ 
++    if (pipe_end->fast)  /* ntdll writes the socket itself */
++    {
++        set_error( STATUS_NOT_SUPPORTED );
++        return;
++    }
++
+     switch (pipe_end->state)
+     {
+     case FILE_PIPE_CONNECTED_STATE:
+@@ -1169,7 +1196,47 @@
+ 
+ static enum server_fd_type pipe_end_get_fd_type( struct fd *fd )
+ {
+-    return FD_TYPE_DEVICE;
++    struct pipe_end *pipe_end = get_fd_user( fd );
++    return pipe_end->fast ? FD_TYPE_PIPE : FD_TYPE_DEVICE;
++}
++
++/* PeekNamedPipe on a pipe backed by a socket pair */
++static void pipe_end_peek_fast( struct pipe_end *pipe_end, data_size_t reply_size )
++{
++    FILE_PIPE_PEEK_BUFFER *buffer;
++    data_size_t avail = pipe_end_get_avail( pipe_end );
++    char *data = NULL;
++    int got = 0;
++
++    switch (pipe_end->state)
++    {
++    case FILE_PIPE_CONNECTED_STATE:
++        break;
++    case FILE_PIPE_CLOSING_STATE:
++        if (avail) break;
++        set_error( STATUS_PIPE_BROKEN );
++        return;
++    default:
++        set_error( pipe_end->pipe ? STATUS_INVALID_PIPE_STATE : STATUS_PIPE_DISCONNECTED );
++        return;
++    }
++
++    reply_size = min( reply_size, avail );
++    if (reply_size)
++    {
++        if (!(data = mem_alloc( reply_size ))) return;
++        got = recv( get_unix_fd( pipe_end->fd ), data, reply_size, MSG_PEEK | MSG_DONTWAIT );
++        if (got < 0) got = 0;
++    }
++    if ((buffer = set_reply_data_size( offsetof( FILE_PIPE_PEEK_BUFFER, Data[got] ) )))
++    {
++        buffer->NamedPipeState    = pipe_end->state;
++        buffer->ReadDataAvailable = avail;
++        buffer->NumberOfMessages  = 0;
++        buffer->MessageLength     = 0;
++        if (got) memcpy( buffer->Data, data, got );
++    }
++    free( data );
+ }
+ 
+ static void pipe_end_peek( struct pipe_end *pipe_end )
+@@ -1186,6 +1253,12 @@
+         return;
+     }
+     reply_size -= offsetof( FILE_PIPE_PEEK_BUFFER, Data );
++
++    if (pipe_end->fast)
++    {
++        pipe_end_peek_fast( pipe_end, reply_size );
++        return;
++    }
+ 
+     switch (pipe_end->state)
+     {
+@@ -1416,6 +1489,7 @@
+     pipe_end->flags = pipe_flags;
+     pipe_end->connection = NULL;
+     pipe_end->buffer_size = buffer_size;
++    pipe_end->fast = 0;
+     init_async_queue( &pipe_end->read_q );
+     init_async_queue( &pipe_end->write_q );
+     list_init( &pipe_end->message_queue );
+@@ -1483,8 +1557,52 @@
+     namespace_add( ((struct named_pipe_device *)parent)->pipes, name );
+     name->parent = grab_object( parent );
+     return 1;
++}
++
++/* Traxis (patches/0008): the pipes CreatePipe makes (Win32.Pipes.*, one
++ * instance, byte mode, synchronous) are backed by a Unix socket pair, which
++ * ntdll reads and writes directly: no server request per read or write.
++ * Everything else about the pipe stays here. WINE_FAST_PIPES=0 turns it off. */
++static int fast_pipes_enabled(void)
++{
++    static int enabled = -1;
++
++    if (enabled == -1)
++    {
++        const char *env = getenv( "WINE_FAST_PIPES" );
++        enabled = !env || atoi( env );
++    }
++    return enabled;
+ }
+ 
++static int is_create_pipe_name( const struct unicode_str *name )
++{
++    static const WCHAR prefix[] = {'W','i','n','3','2','.','P','i','p','e','s','.'};
++    data_size_t len = name->len / sizeof(WCHAR), start = len;
++
++    while (start && name->str[start - 1] != '\\') start--;
++    return len - start > ARRAY_SIZE(prefix) && !memcmp( name->str + start, prefix, sizeof(prefix) );
++}
++
++static void make_fast_pipe( struct named_pipe *pipe, struct pipe_server *server )
++{
++    int sv[2], i, on = 1, size = pipe->insize > 65536 ? pipe->insize : 65536;
++
++    if (socketpair( PF_UNIX, SOCK_STREAM, 0, sv ) == -1) return;
++    for (i = 0; i < 2; i++)
++    {
++        fcntl( sv[i], F_SETFL, O_NONBLOCK );
++#ifdef SO_NOSIGPIPE
++        setsockopt( sv[i], SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on) );
++#endif
++        setsockopt( sv[i], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size) );
++        setsockopt( sv[i], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size) );
++    }
++    set_fd_unix_fd( server->pipe_end.fd, sv[0] );
++    server->pipe_end.fast = 1;
++    pipe->fast_client_sock = sv[1];
++}
++
+ static struct object *named_pipe_open_file( struct object *obj, unsigned int access,
+                                             unsigned int sharing, unsigned int options )
+ {
+@@ -1500,6 +1618,13 @@
+     }
+     server = LIST_ENTRY( list_head( &pipe->listeners ), struct pipe_server, entry );
+ 
++    /* the socket pair connects only the first client */
++    if (server->pipe_end.fast && pipe->fast_client_sock == -1)
++    {
++        set_error( STATUS_PIPE_NOT_AVAILABLE );
++        return NULL;
++    }
++
+     pipe_sharing = pipe->sharing;
+     if (((access & GENERIC_READ) && !(pipe_sharing & FILE_SHARE_READ)) ||
+         ((access & GENERIC_WRITE) && !(pipe_sharing & FILE_SHARE_WRITE)))
+@@ -1517,6 +1642,12 @@
+         server->pipe_end.client_pid = client->client_pid;
+         client->server_pid = server->pipe_end.server_pid;
+         list_remove( &server->entry );
++        if (server->pipe_end.fast)
++        {
++            set_fd_unix_fd( client->fd, pipe->fast_client_sock );
++            client->fast = 1;
++            pipe->fast_client_sock = -1;
++        }
+     }
+     return &client->obj;
+ }
+@@ -1653,6 +1784,7 @@
+         pipe->timeout = req->timeout;
+         pipe->message_mode = (req->flags & NAMED_PIPE_MESSAGE_STREAM_WRITE) != 0;
+         pipe->sharing = req->sharing;
++        pipe->fast_client_sock = -1;
+         if (sd) default_set_sd( &pipe->obj, sd, OWNER_SECURITY_INFORMATION |
+                                                 GROUP_SECURITY_INFORMATION |
+                                                 DACL_SECURITY_INFORMATION |
+@@ -1677,6 +1809,10 @@
+     }
+ 
+     server = create_pipe_server( pipe, req->options, req->flags );
++    if (server && reply->created && fast_pipes_enabled() && pipe->maxinstances == 1 &&
++        !pipe->message_mode && !(req->flags & NAMED_PIPE_MESSAGE_STREAM_READ) &&
++        (req->options & FILE_SYNCHRONOUS_IO_NONALERT) && is_create_pipe_name( &name ))
++        make_fast_pipe( pipe, server );
+     if (server)
+     {
+         reply->handle = alloc_handle( current->process, server, req->access, objattr->attributes );
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -241,6 +241,8 @@
+                                               union apc_result *result );
+ extern int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+                                int *needs_close, enum server_fd_type *type, unsigned int *options );
++extern int server_get_pipe_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
++                                    int *needs_close, unsigned int *options );
+ extern int wine_server_receive_fd( obj_handle_t *handle );
+ extern void process_exit_wrapper( int status ) DECLSPEC_NORETURN;
+ extern size_t server_init_process(void);
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1291,7 +1291,7 @@
+  *
+  * The returned unix_fd should be closed iff needs_close is non-zero.
+  */
+-int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
++static int get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
+                         int *needs_close, enum server_fd_type *type, unsigned int *options )
+ {
+     sigset_t sigset;
+@@ -1343,6 +1343,42 @@
+         if (*needs_close) close( fd );
+     }
+     if (!ret) *unix_fd = fd;
++    return ret;
++}
++
++/* Traxis (patches/0008): a pipe backed by a socket pair (FD_TYPE_PIPE) is
++ * read and written directly by NtReadFile and NtWriteFile only; to every
++ * other caller it stays a device without a Unix fd, as before. */
++int server_get_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
++                        int *needs_close, enum server_fd_type *type, unsigned int *options )
++{
++    enum server_fd_type fd_type;
++    int ret = get_unix_fd( handle, wanted_access, unix_fd, needs_close, &fd_type, options );
++
++    if (!ret && fd_type == FD_TYPE_PIPE)
++    {
++        if (*needs_close) close( *unix_fd );
++        *unix_fd = -1;
++        *needs_close = 0;
++        return STATUS_BAD_DEVICE_TYPE;
++    }
++    if (type) *type = fd_type;
++    return ret;
++}
++
++int server_get_pipe_unix_fd( HANDLE handle, unsigned int wanted_access, int *unix_fd,
++                             int *needs_close, unsigned int *options )
++{
++    enum server_fd_type fd_type;
++    int ret = get_unix_fd( handle, wanted_access, unix_fd, needs_close, &fd_type, options );
++
++    if (!ret && fd_type != FD_TYPE_PIPE)
++    {
++        if (*needs_close) close( *unix_fd );
++        *unix_fd = -1;
++        *needs_close = 0;
++        return STATUS_BAD_DEVICE_TYPE;
++    }
+     return ret;
+ }
+ 
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5740,8 +5740,140 @@
+ 
+     if (wait_handle) status = wait_async( wait_handle, (options & FILE_SYNCHRONOUS_IO_ALERT) );
+     return status;
++}
++
++static void add_completion( HANDLE handle, ULONG_PTR value, NTSTATUS status, ULONG info, BOOL async );
++
++/* Traxis (patches/0008): finish a read or write on a pipe backed by a socket
++ * pair, the way the generic path finishes synchronous I/O */
++static NTSTATUS finish_pipe_io( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
++                                IO_STATUS_BLOCK *io, NTSTATUS status, ULONG_PTR total,
++                                unsigned int options )
++{
++    BOOL is_async = !(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT));
++
++    if (!NT_ERROR( status ))
++    {
++        set_sync_iosb( io, status, total, options );
++        if (event) NtSetEvent( event, NULL );
++        if (apc) NtQueueApcThread( GetCurrentThread(), (PNTAPCFUNC)apc, (ULONG_PTR)apc_user,
++                                   iosb_client_ptr(io), 0 );
++        else if (apc_user && is_async) add_completion( handle, (ULONG_PTR)apc_user, status, total, FALSE );
++    }
++    else if (event) NtResetEvent( event, NULL );
++    return status;
++}
++
++/* Traxis (patches/0008): whether the pipe end is in PIPE_NOWAIT mode, set
++ * with SetNamedPipeHandleState; the server keeps it. Asked only when a read
++ * would wait. */
++static BOOL fast_pipe_is_nowait( HANDLE handle )
++{
++    FILE_PIPE_INFORMATION info;
++    IO_STATUS_BLOCK iosb;
++
++    return !NtQueryInformationFile( handle, &iosb, &info, sizeof(info), FilePipeInformation ) &&
++           info.CompletionMode == FILE_PIPE_COMPLETE_OPERATION;
++}
++
++/* Traxis (patches/0008): read a pipe backed by a socket pair directly.
++ * Returns STATUS_BAD_DEVICE_TYPE if the handle isn't one. Like a pipe on
++ * Windows, a read returns what is there (waiting only while nothing is, and
++ * not at all in PIPE_NOWAIT mode); end of file means all handles to the other
++ * end are closed. */
++static NTSTATUS fast_pipe_read( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
++                                IO_STATUS_BLOCK *io, void *buffer, ULONG length )
++{
++    int fd, needs_close;
++    unsigned int options;
++    NTSTATUS status;
++    BOOL checked_mode = FALSE;
++    ssize_t ret;
++
++    if ((status = server_get_pipe_unix_fd( handle, FILE_READ_DATA, &fd, &needs_close, &options )))
++        return status == STATUS_ACCESS_DENIED ? status : STATUS_BAD_DEVICE_TYPE;
++
++    for (;;)
++    {
++        if ((ret = virtual_locked_read( fd, buffer, length )) > 0 || (!ret && !length))
++        {
++            status = STATUS_SUCCESS;
++            break;
++        }
++        if (!ret)
++        {
++            status = STATUS_PIPE_BROKEN;
++            break;
++        }
++        if (errno == EINTR) continue;
++        if (errno == EAGAIN)
++        {
++            struct pollfd pfd = { fd, POLLIN, 0 };
++
++            if (!checked_mode)
++            {
++                checked_mode = TRUE;
++                if (fast_pipe_is_nowait( handle ))
++                {
++                    status = STATUS_PIPE_EMPTY;  /* as the server answers */
++                    break;
++                }
++            }
++            poll( &pfd, 1, -1 );
++            continue;
++        }
++        status = errno == EFAULT ? STATUS_ACCESS_VIOLATION : errno_to_status( errno );
++        break;
++    }
++    if (needs_close) close( fd );
++    return finish_pipe_io( handle, event, apc, apc_user, io, status, ret > 0 ? ret : 0, options );
+ }
+ 
++/* Traxis (patches/0008): write a pipe backed by a socket pair directly;
++ * returns when all of the data is in the pipe, like a pipe on Windows, or in
++ * PIPE_NOWAIT mode with what fits, as the server does. */
++static NTSTATUS fast_pipe_write( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user,
++                                 IO_STATUS_BLOCK *io, const void *buffer, ULONG length )
++{
++    int fd, needs_close;
++    unsigned int options;
++    NTSTATUS status = STATUS_SUCCESS;
++    BOOL checked_mode = FALSE;
++    ULONG total = 0;
++    ssize_t ret;
++
++    if ((status = server_get_pipe_unix_fd( handle, FILE_WRITE_DATA, &fd, &needs_close, &options )))
++        return status == STATUS_ACCESS_DENIED ? status : STATUS_BAD_DEVICE_TYPE;
++
++    while (total < length)
++    {
++        if ((ret = write( fd, (const char *)buffer + total, length - total )) >= 0)
++        {
++            total += ret;
++            continue;
++        }
++        if (errno == EINTR) continue;
++        if (errno == EAGAIN)
++        {
++            struct pollfd pfd = { fd, POLLOUT, 0 };
++
++            if (!checked_mode)
++            {
++                checked_mode = TRUE;
++                if (fast_pipe_is_nowait( handle )) break;
++            }
++            poll( &pfd, 1, -1 );
++            continue;
++        }
++        /* the reading end is closed, as STATUS_PIPE_CLOSING from the server */
++        if (errno == EPIPE) status = STATUS_PIPE_CLOSING;
++        else status = errno == EFAULT ? STATUS_ACCESS_VIOLATION : errno_to_status( errno );
++        break;
++    }
++    if (needs_close) close( fd );
++    return finish_pipe_io( handle, event, apc, apc_user, io, status, total, options );
++}
++
+ /* do an ioctl call through the server */
+ static NTSTATUS server_ioctl_file( HANDLE handle, HANDLE event,
+                                    PIO_APC_ROUTINE apc, PVOID apc_context,
+@@ -6040,7 +6172,11 @@
+     if (!virtual_check_buffer_for_write( buffer, length )) return STATUS_ACCESS_VIOLATION;
+ 
+     if (status == STATUS_BAD_DEVICE_TYPE)
++    {
++        if ((status = fast_pipe_read( handle, event, apc, apc_user, io, buffer, length )) != STATUS_BAD_DEVICE_TYPE)
++            return status;
+         return server_read_file( handle, event, apc, apc_user, io, buffer, length, offset, key );
++    }
+ 
+     async_read = !(options & (FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT));
+ 
+@@ -6338,7 +6474,11 @@
+     }
+ 
+     if (status == STATUS_BAD_DEVICE_TYPE)
++    {
++        if ((status = fast_pipe_write( handle, event, apc, apc_user, io, buffer, length )) != STATUS_BAD_DEVICE_TYPE)
++            return status;
+         return server_write_file( handle, event, apc, apc_user, io, buffer, length, offset, key );
++    }
+ 
+     if (type == FD_TYPE_FILE)
+     {

@@ -1,0 +1,173 @@
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -116,6 +116,9 @@
+     PRTL_THREAD_START_ROUTINE start;         /* thread entry point */
+     void                     *param;         /* thread entry point parameter */
+     void                     *jmp_buf;       /* setjmp buffer for exception handling */
++    int                       server_section; /* depth of server calls; signals deferred while > 0 */
++    int                       deferred_signal; /* a signal was deferred, deferred_mask to restore */
++    sigset_t                  deferred_mask; /* signal mask from before the deferred signal */
+ };
+ 
+ C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
+@@ -203,6 +206,7 @@
+ extern int inproc_device_fd;
+ extern timeout_t server_start_time;
+ extern sigset_t server_block_set;
++extern BOOL server_lazy_sigmask;
+ extern pthread_mutex_t fd_cache_mutex;
+ extern struct _KUSER_SHARED_DATA *user_shared_data;
+ 
+@@ -227,6 +231,7 @@
+ extern unsigned int server_call_unlocked( void *req_ptr );
+ extern void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
+ extern void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset );
++extern BOOL server_defer_signal( int signal, sigset_t *handler_mask );
+ extern unsigned int server_select( const union select_op *select_op, data_size_t size, UINT flags,
+                                    timeout_t abs_timeout, struct context_data *context, struct user_apc *user_apc );
+ extern unsigned int server_wait( const union select_op *select_op, data_size_t size, UINT flags,
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -378,15 +378,74 @@
+  *           wine_server_call
+  *
+  * Perform a server call.
++ */
++/* Traxis (patches/0007): instead of blocking server_block_set around every
++ * server call (two system calls, ~0.9 us on macOS), count the calls the thread
++ * is in. A handler for one of those signals that arrives meanwhile defers
++ * itself (server_defer_signal): it blocks them in the interrupted context and
++ * queues the signal again, and server_section_leave restores the mask, which
++ * delivers it. Same order as with blocking, paid only when a signal comes.
++ * WINE_LAZY_SIGMASK=0 turns it off. */
++BOOL server_lazy_sigmask = TRUE;
++
++static inline void server_section_enter( sigset_t *old_set )
++{
++    if (!server_lazy_sigmask)
++    {
++        pthread_sigmask( SIG_BLOCK, &server_block_set, old_set );
++        return;
++    }
++    ntdll_get_thread_data()->server_section++;
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++}
++
++static inline void server_section_leave( const sigset_t *old_set )
++{
++    struct ntdll_thread_data *data;
++
++    if (!server_lazy_sigmask)
++    {
++        pthread_sigmask( SIG_SETMASK, old_set, NULL );
++        return;
++    }
++    data = ntdll_get_thread_data();
++    __atomic_signal_fence( __ATOMIC_SEQ_CST );
++    if (--data->server_section || !data->deferred_signal) return;
++    data->deferred_signal = 0;
++    pthread_sigmask( SIG_SETMASK, &data->deferred_mask, NULL );
++}
++
++/***********************************************************************
++ *           server_defer_signal
++ *
++ * Called first by the handlers of signals in server_block_set, with the
++ * interrupted context's mask. Returns TRUE if the handler must return now.
+  */
++BOOL server_defer_signal( int signal, sigset_t *handler_mask )
++{
++    struct ntdll_thread_data *data = ntdll_get_thread_data();
++    int i;
++
++    if (!data->server_section) return FALSE;
++    if (!data->deferred_signal)
++    {
++        data->deferred_mask = *handler_mask;
++        data->deferred_signal = 1;
++    }
++    for (i = 1; i < NSIG; i++)
++        if (sigismember( &server_block_set, i )) sigaddset( handler_mask, i );
++    pthread_kill( pthread_self(), signal );
++    return TRUE;
++}
++
+ unsigned int CDECL wine_server_call( void *req_ptr )
+ {
+     sigset_t old_set;
+     unsigned int ret;
+ 
+-    pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
++    server_section_enter( &old_set );
+     ret = server_call_unlocked( req_ptr );
+-    pthread_sigmask( SIG_SETMASK, &old_set, NULL );
++    server_section_leave( &old_set );
+     return ret;
+ }
+ 
+@@ -407,7 +466,7 @@
+  */
+ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
+ {
+-    pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
++    server_section_enter( sigset );
+     mutex_lock( mutex );
+ }
+ 
+@@ -418,7 +477,7 @@
+ void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
+ {
+     mutex_unlock( mutex );
+-    pthread_sigmask( SIG_SETMASK, sigset, NULL );
++    server_section_leave( sigset );
+ }
+ 
+ 
+@@ -816,7 +875,7 @@
+ 
+     do
+     {
+-        pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
++        server_section_enter( &old_set );
+         for (;;)
+         {
+             SERVER_START_REQ( select )
+@@ -850,7 +909,7 @@
+             if (size >= sizeof(select_op->signal_and_wait) && select_op->op == SELECT_SIGNAL_AND_WAIT)
+                 size = offsetof( union select_op, signal_and_wait.signal );
+         }
+-        pthread_sigmask( SIG_SETMASK, &old_set, NULL );
++        server_section_leave( &old_set );
+         if (signaled) break;
+ 
+         ret = wait_select_reply( &cookie );
+@@ -1699,6 +1758,11 @@
+             fatal_error( "WINEARCH set to invalid value '%s', it must be win32, win64, or wow64.\n", arch );
+ 
+         fd_socket = server_connect();
++    }
++
++    {
++        const char *lazy = getenv( "WINE_LAZY_SIGMASK" );
++        if (lazy) server_lazy_sigmask = atoi( lazy ) != 0;
+     }
+ 
+     /* setup the signal mask */
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2686,6 +2686,7 @@
+     ucontext_t *ucontext = init_handler( sigcontext );
+     HANDLE handle;
+ 
++    if (server_defer_signal( signal, &((ucontext_t *)sigcontext)->uc_sigmask )) return;
+     if (p__wine_ctrl_routine)
+     {
+         if (!NtCreateThreadEx( &handle, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
+@@ -2733,6 +2734,7 @@
+ {
+     ucontext_t *ucontext = init_handler( sigcontext );
+ 
++    if (server_defer_signal( signal, &((ucontext_t *)sigcontext)->uc_sigmask )) return;
+     if (is_inside_syscall( RSP_sig(ucontext) ))
+     {
+         struct syscall_frame *frame = get_syscall_frame();

@@ -1,0 +1,63 @@
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -687,11 +687,33 @@
+         EV_SET( &ev[1], fd->unix_fd, EVFILT_WRITE, EV_DELETE, 0, 0, 0 );
+         kevent( kqueue_fd, ev, 2, NULL, 0, NULL );
+     }
++}
++
++/* Traxis (patches/0006): how long the server keeps polling for the next
++ * event before it sleeps, after it handled one. Clients that make many
++ * requests in a row (installers' unpacking helpers) then find it awake;
++ * waking it costs ~5-10 us on macOS. WINESERVER_SPIN_US, 0 turns it off. */
++static long long server_spin_ns(void)
++{
++    static long long spin = -1;
++    if (spin < 0)
++    {
++        const char *env = getenv( "WINESERVER_SPIN_US" );
++        spin = (env ? atoll( env ) : 50) * 1000;
++    }
++    return spin;
++}
++
++static inline long long spin_clock_ns(void)
++{
++    struct timespec t;
++    clock_gettime( CLOCK_MONOTONIC, &t );
++    return t.tv_sec * 1000000000LL + t.tv_nsec;
+ }
+ 
+ static inline void main_loop_epoll(void)
+ {
+-    int i, ret, timeout;
++    int i, ret = 0, timeout;
+     struct timespec ts;
+     struct kevent events[128];
+ 
+@@ -699,12 +721,24 @@
+ 
+     while (active_users)
+     {
++        int busy = ret > 0;
++
+         timeout = get_next_timeout( &ts );
+ 
+         if (!active_users) break;  /* last user removed by a timeout */
+         if (kqueue_fd == -1) break;  /* an error occurred with kqueue */
+ 
+-        ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts );
++        ret = 0;
++        if (busy && timeout != 0 && server_spin_ns())
++        {
++            static const struct timespec zero;
++            long long end = spin_clock_ns() + server_spin_ns();
++            while (!(ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), &zero )) &&
++                   spin_clock_ns() < end)
++                ;
++        }
++        if (!ret)
++            ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts );
+ 
+         set_current_time();
+ 

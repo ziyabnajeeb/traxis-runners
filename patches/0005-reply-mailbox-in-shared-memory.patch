@@ -1,0 +1,475 @@
+--- a/include/wine/reply_mailbox.h
++++ b/include/wine/reply_mailbox.h
+@@ -0,0 +1,40 @@
++/*
++ * Traxis (patches/0005): a per-thread page shared by a client thread and the
++ * wineserver, where the server writes a reply while the thread spins for it.
++ *
++ * A server round trip through the reply pipe costs ~10 us on macOS, mostly
++ * putting the client thread to sleep and waking it up; most replies are ready
++ * within microseconds. The client marks the mailbox SPINNING before sending a
++ * request and spins on it for a short while. If the server replies while the
++ * client is still spinning, it moves SPINNING -> WRITING, copies the reply
++ * here and sets READY; the client copies it out and sets IDLE. If the client
++ * stops spinning first, it moves SPINNING -> GAVE_UP and reads the reply
++ * pipe as before, where the server then writes the reply. Each move is a
++ * compare-and-swap, so every reply goes exactly one way.
++ */
++
++#ifndef __WINE_WINE_REPLY_MAILBOX_H
++#define __WINE_WINE_REPLY_MAILBOX_H
++
++#include <wine/server_protocol.h>
++
++enum reply_mailbox_state
++{
++    REPLY_MAILBOX_IDLE,
++    REPLY_MAILBOX_SPINNING,  /* client waits here for its reply */
++    REPLY_MAILBOX_WRITING,   /* server is copying the reply in */
++    REPLY_MAILBOX_READY,     /* reply is here */
++    REPLY_MAILBOX_GAVE_UP    /* client reads the reply pipe instead */
++};
++
++#define REPLY_MAILBOX_SIZE 16384
++
++struct reply_mailbox
++{
++    int                 state;  /* enum reply_mailbox_state, accessed atomically */
++    int                 pad;
++    union generic_reply reply;  /* the reply header */
++    char                data[REPLY_MAILBOX_SIZE - 8 - sizeof(union generic_reply)];  /* reply data */
++};
++
++#endif  /* __WINE_WINE_REPLY_MAILBOX_H */
+--- a/server/protocol.def
++++ b/server/protocol.def
+@@ -4272,3 +4272,12 @@
+     data_size_t         runtime_size;   /* size of client runtime data */
+     VARARG(runtime,bytes);              /* client runtime data */
+ @END
++
++
++/* Traxis (patches/0005): give the server the calling thread's reply
++ * mailbox (include/wine/reply_mailbox.h), shared memory sent with send_fd.
++ * Last in the list, so the other requests keep their numbers. */
++@REQ(set_reply_mailbox)
++    int          fd;           /* fd of the shared memory */
++    data_size_t  size;         /* its size, sizeof(struct reply_mailbox) */
++@END
+--- a/include/wine/server_protocol.h
++++ b/include/wine/server_protocol.h
+@@ -6161,6 +6161,22 @@
+ };
+ 
+ 
++/* Traxis (patches/0005): give the server the calling thread's reply
++ * mailbox (include/wine/reply_mailbox.h), shared memory sent with send_fd.
++ * Last in the list, so the other requests keep their numbers. */
++struct set_reply_mailbox_request
++{
++    struct request_header __header;
++    int          fd;
++    data_size_t  size;
++    char __pad_20[4];
++};
++struct set_reply_mailbox_reply
++{
++    struct reply_header __header;
++};
++
++
+ enum request
+ {
+     REQ_new_process,
+@@ -6469,6 +6485,7 @@
+     REQ_d3dkmt_object_open_name,
+     REQ_d3dkmt_mutex_acquire,
+     REQ_d3dkmt_mutex_release,
++    REQ_set_reply_mailbox,
+     REQ_NB_REQUESTS
+ };
+ 
+@@ -6782,6 +6799,7 @@
+     struct d3dkmt_object_open_name_request d3dkmt_object_open_name_request;
+     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
+     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
++    struct set_reply_mailbox_request set_reply_mailbox_request;
+ };
+ union generic_reply
+ {
+@@ -7093,8 +7111,9 @@
+     struct d3dkmt_object_open_name_reply d3dkmt_object_open_name_reply;
+     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
+     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
++    struct set_reply_mailbox_reply set_reply_mailbox_reply;
+ };
+ 
+-#define SERVER_PROTOCOL_VERSION 1809
++#define SERVER_PROTOCOL_VERSION 1810
+ 
+ #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
+--- a/server/request_handlers.h
++++ b/server/request_handlers.h
+@@ -313,6 +313,7 @@
+ DECL_HANDLER(d3dkmt_object_open_name);
+ DECL_HANDLER(d3dkmt_mutex_acquire);
+ DECL_HANDLER(d3dkmt_mutex_release);
++DECL_HANDLER(set_reply_mailbox);
+ 
+ typedef void (*req_handler)( const void *req, void *reply );
+ static const req_handler req_handlers[REQ_NB_REQUESTS] =
+@@ -623,6 +624,7 @@
+     (req_handler)req_d3dkmt_object_open_name,
+     (req_handler)req_d3dkmt_mutex_acquire,
+     (req_handler)req_d3dkmt_mutex_release,
++    (req_handler)req_set_reply_mailbox,
+ };
+ 
+ C_ASSERT( sizeof(abstime_t) == 8 );
+@@ -2374,3 +2376,6 @@
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, fence_value) == 24 );
+ C_ASSERT( offsetof(struct d3dkmt_mutex_release_request, runtime_size) == 32 );
+ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
++C_ASSERT( offsetof(struct set_reply_mailbox_request, fd) == 12 );
++C_ASSERT( offsetof(struct set_reply_mailbox_request, size) == 16 );
++C_ASSERT( sizeof(struct set_reply_mailbox_request) == 24 );
+--- a/server/request_trace.h
++++ b/server/request_trace.h
+@@ -3509,6 +3509,12 @@
+     dump_varargs_bytes( ", runtime=", cur_size );
+ }
+ 
++static void dump_set_reply_mailbox_request( const struct set_reply_mailbox_request *req )
++{
++    fprintf( stderr, " fd=%d", req->fd );
++    fprintf( stderr, ", size=%u", req->size );
++}
++
+ typedef void (*dump_func)( const void *req );
+ 
+ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
+@@ -3819,6 +3825,7 @@
+     (dump_func)dump_d3dkmt_object_open_name_request,
+     (dump_func)dump_d3dkmt_mutex_acquire_request,
+     (dump_func)dump_d3dkmt_mutex_release_request,
++    (dump_func)dump_set_reply_mailbox_request,
+ };
+ 
+ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
+@@ -4128,6 +4135,7 @@
+     (dump_func)dump_d3dkmt_share_objects_reply,
+     (dump_func)dump_d3dkmt_object_open_name_reply,
+     (dump_func)dump_d3dkmt_mutex_acquire_reply,
++    NULL,
+     NULL,
+ };
+ 
+@@ -4439,6 +4447,7 @@
+     "d3dkmt_object_open_name",
+     "d3dkmt_mutex_acquire",
+     "d3dkmt_mutex_release",
++    "set_reply_mailbox",
+ };
+ 
+ static const struct
+--- a/server/request.c
++++ b/server/request.c
+@@ -61,6 +61,7 @@
+ #include "security.h"
+ #include "handle.h"
+ #include "request_handlers.h"
++#include "wine/reply_mailbox.h"
+ 
+ /* Some versions of glibc don't define this */
+ #ifndef SCM_RIGHTS
+@@ -249,7 +250,24 @@
+ /* send a reply to the current thread */
+ static void send_reply( union generic_reply *reply )
+ {
++    struct reply_mailbox *mailbox = current->reply_mailbox;
+     int ret;
++
++    /* Traxis (patches/0005): the client is still spinning for its reply */
++    if (mailbox && current->reply_size <= sizeof(mailbox->data))
++    {
++        int expected = REPLY_MAILBOX_SPINNING;
++        if (__atomic_compare_exchange_n( &mailbox->state, &expected, REPLY_MAILBOX_WRITING, 0,
++                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED ))
++        {
++            mailbox->reply = *reply;
++            if (current->reply_size) memcpy( mailbox->data, current->reply_data, current->reply_size );
++            __atomic_store_n( &mailbox->state, REPLY_MAILBOX_READY, __ATOMIC_RELEASE );
++            free( current->reply_data );
++            current->reply_data = NULL;
++            return;
++        }
++    }
+ 
+     if (!current->reply_size)
+     {
+--- a/server/thread.h
++++ b/server/thread.h
+@@ -74,6 +74,7 @@
+     unsigned int           reply_towrite; /* amount of data still to write in reply */
+     struct fd             *request_fd;    /* fd for receiving client requests */
+     struct fd             *reply_fd;      /* fd to send a reply to a client */
++    struct reply_mailbox  *reply_mailbox; /* Traxis (patches/0005): shared reply page, or NULL */
+     struct fd             *wait_fd;       /* fd to use to wake a sleeping client */
+     enum run_state         state;         /* running state */
+     int                    exit_code;     /* thread exit code */
+--- a/server/thread.c
++++ b/server/thread.c
+@@ -32,6 +32,7 @@
+ #include <unistd.h>
+ #include <time.h>
+ #include <poll.h>
++#include <sys/mman.h>
+ #ifdef HAVE_SCHED_H
+ /* FreeBSD needs this for cpu_set_t instead of its cpuset_t */
+ #define _WITH_CPU_SET_T
+@@ -61,6 +62,7 @@
+ #include "user.h"
+ #include "security.h"
+ #include "msync.h"
++#include "wine/reply_mailbox.h"
+ 
+ 
+ /* thread queues */
+@@ -416,6 +418,7 @@
+     thread->reply_towrite   = 0;
+     thread->request_fd      = NULL;
+     thread->reply_fd        = NULL;
++    thread->reply_mailbox   = NULL;
+     thread->wait_fd         = NULL;
+     thread->state           = RUNNING;
+     thread->exit_code       = 0;
+@@ -625,6 +628,8 @@
+     free( thread->reply_data );
+     if (thread->request_fd) release_object( thread->request_fd );
+     if (thread->reply_fd) release_object( thread->reply_fd );
++    if (thread->reply_mailbox) munmap( thread->reply_mailbox, sizeof(*thread->reply_mailbox) );
++    thread->reply_mailbox = NULL;
+     if (thread->wait_fd) release_object( thread->wait_fd );
+     cleanup_clipboard_thread(thread);
+     destroy_thread_windows( thread );
+@@ -1783,6 +1788,34 @@
+ }
+ 
+ /* initialize a new thread */
++/* Traxis (patches/0005): map the calling thread's reply mailbox */
++DECL_HANDLER(set_reply_mailbox)
++{
++    int fd = thread_get_inflight_fd( current, req->fd );
++    void *ptr;
++
++    if (fd == -1)
++    {
++        set_error( STATUS_INVALID_HANDLE );
++        return;
++    }
++    if (req->size != sizeof(struct reply_mailbox))
++    {
++        close( fd );
++        set_error( STATUS_INVALID_PARAMETER );
++        return;
++    }
++    ptr = mmap( NULL, req->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
++    close( fd );
++    if (ptr == MAP_FAILED)
++    {
++        file_set_error();
++        return;
++    }
++    if (current->reply_mailbox) munmap( current->reply_mailbox, sizeof(*current->reply_mailbox) );
++    current->reply_mailbox = ptr;
++}
++
+ DECL_HANDLER(init_thread)
+ {
+     if (!init_thread( current, req->reply_fd, req->wait_fd )) return;
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -80,6 +80,7 @@
+ #include "wine/debug.h"
+ #include "unix_private.h"
+ #include "ddk/wdm.h"
++#include "wine/reply_mailbox.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(server);
+ WINE_DECLARE_DEBUG_CHANNEL(syscall);
+@@ -265,9 +266,69 @@
+     }
+     /* the server closed the connection; time to die... */
+     abort_thread(0);
++}
++
++
++/* Traxis (patches/0005): this thread's reply mailbox, see wine/reply_mailbox.h */
++static __thread struct reply_mailbox *reply_mailbox;
++static void init_reply_mailbox(void);
++static long long reply_mailbox_spin = -1;  /* ns; 0 turns the mailbox off */
++
++static long long reply_mailbox_spin_ns(void)
++{
++    if (reply_mailbox_spin < 0)
++    {
++        const char *env = getenv( "WINE_REPLY_MAILBOX_SPIN_US" );
++        reply_mailbox_spin = (env ? atoll( env ) : 20) * 1000;
++    }
++    return reply_mailbox_spin;
++}
++
++static inline long long monotonic_ns(void)
++{
++    struct timespec t;
++    clock_gettime( CLOCK_MONOTONIC, &t );
++    return t.tv_sec * 1000000000LL + t.tv_nsec;
++}
++
++static inline void spin_pause(void)
++{
++#if defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#elif defined(__aarch64__)
++    __asm__ __volatile__( "yield" );
++#endif
+ }
+ 
++/* Spins until the reply is in the mailbox (TRUE), or gives up and leaves it
++ * to the reply pipe (FALSE). */
++static BOOL wait_reply_mailbox( struct reply_mailbox *mailbox )
++{
++    long long limit = 0;
++    unsigned int i;
+ 
++    for (i = 0;; i++)
++    {
++        int state = __atomic_load_n( &mailbox->state, __ATOMIC_ACQUIRE );
++
++        if (state == REPLY_MAILBOX_READY) return TRUE;
++        /* while the server is WRITING, wait for it: that takes no time */
++        if (state == REPLY_MAILBOX_SPINNING && !(i & 63))
++        {
++            long long now = monotonic_ns();
++            if (!limit) limit = now + reply_mailbox_spin_ns();
++            else if (now >= limit)
++            {
++                int expected = REPLY_MAILBOX_SPINNING;
++                if (__atomic_compare_exchange_n( &mailbox->state, &expected, REPLY_MAILBOX_GAVE_UP, 0,
++                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
++                    return FALSE;
++            }
++        }
++        spin_pause();
++    }
++}
++
+ /***********************************************************************
+  *           wait_reply
+  *
+@@ -275,9 +336,20 @@
+  */
+ static inline unsigned int wait_reply( struct __server_request_info *req )
+ {
++    struct reply_mailbox *mailbox = reply_mailbox;
++
++    if (mailbox && wait_reply_mailbox( mailbox ))
++    {
++        req->u.reply = mailbox->reply;
++        if (req->u.reply.reply_header.reply_size)
++            memcpy( req->reply_data, mailbox->data, req->u.reply.reply_header.reply_size );
++        __atomic_store_n( &mailbox->state, REPLY_MAILBOX_IDLE, __ATOMIC_RELEASE );
++        return req->u.reply.reply_header.error;
++    }
+     read_reply_data( &req->u.reply, sizeof(req->u.reply) );
+     if (req->u.reply.reply_header.reply_size)
+         read_reply_data( req->reply_data, req->u.reply.reply_header.reply_size );
++    if (mailbox) __atomic_store_n( &mailbox->state, REPLY_MAILBOX_IDLE, __ATOMIC_RELEASE );
+     return req->u.reply.reply_header.error;
+ }
+ 
+@@ -288,9 +360,16 @@
+ unsigned int server_call_unlocked( void *req_ptr )
+ {
+     struct __server_request_info * const req = req_ptr;
++    struct reply_mailbox *mailbox = reply_mailbox;
+     unsigned int ret;
+ 
+-    if ((ret = send_request( req ))) return ret;
++    /* Traxis (patches/0005): before the request, so the server sees it */
++    if (mailbox) __atomic_store_n( &mailbox->state, REPLY_MAILBOX_SPINNING, __ATOMIC_RELEASE );
++    if ((ret = send_request( req )))
++    {
++        if (mailbox) __atomic_store_n( &mailbox->state, REPLY_MAILBOX_IDLE, __ATOMIC_RELEASE );
++        return ret;
++    }
+     return wait_reply( req );
+ }
+ 
+@@ -1692,6 +1771,7 @@
+     close( reply_pipe );
+ 
+     if (ret) server_protocol_error( "init_first_thread failed with status %x\n", ret );
++    init_reply_mailbox();
+ 
+     if (!supported_machines_count)
+         fatal_error( "'%s' is a 64-bit installation, it cannot be used with a 32-bit wineserver.\n",
+@@ -1813,6 +1893,40 @@
+  *
+  * Send an init thread request.
+  */
++/* Traxis (patches/0005): gives the calling thread a reply mailbox, shared
++ * memory the server maps too. Without one, replies use the pipe only. */
++static void init_reply_mailbox(void)
++{
++    static LONG counter;
++    struct reply_mailbox *mailbox;
++    unsigned int status;
++    char name[32];
++    int fd;
++
++    if (!reply_mailbox_spin_ns()) return;
++    snprintf( name, sizeof(name), "/wmbx.%x.%x", (unsigned int)getpid(),
++              (unsigned int)InterlockedIncrement( &counter ) );
++    if ((fd = shm_open( name, O_RDWR | O_CREAT | O_EXCL, 0600 )) == -1) return;
++    shm_unlink( name );
++    if (ftruncate( fd, sizeof(*mailbox) ) == -1 ||
++        (mailbox = mmap( NULL, sizeof(*mailbox), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
++    {
++        close( fd );
++        return;
++    }
++    wine_server_send_fd( fd );
++    SERVER_START_REQ( set_reply_mailbox )
++    {
++        req->fd   = fd;
++        req->size = sizeof(*mailbox);
++        status = wine_server_call( req );
++    }
++    SERVER_END_REQ;
++    close( fd );
++    if (status) munmap( mailbox, sizeof(*mailbox) );
++    else reply_mailbox = mailbox;
++}
++
+ void server_init_thread( void *entry_point, BOOL *suspend )
+ {
+     void *teb;
+@@ -1833,6 +1947,7 @@
+     }
+     SERVER_END_REQ;
+     close( reply_pipe );
++    init_reply_mailbox();
+ }
+ 
+ NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES *attr,
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -987,6 +987,7 @@
+ 	wine/orpc.idl \
+ 	wine/plugplay.idl \
+ 	wine/rbtree.h \
++	wine/reply_mailbox.h \
+ 	wine/schrpc.idl \
+ 	wine/server.h \
+ 	wine/server_protocol.h \

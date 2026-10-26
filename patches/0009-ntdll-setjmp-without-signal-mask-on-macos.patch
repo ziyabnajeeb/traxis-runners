@@ -1,0 +1,45 @@
+--- a/include/wine/unixlib.h
++++ b/include/wine/unixlib.h
+@@ -51,6 +51,17 @@
+ 
+ NTSYSAPI void ntdll_set_exception_jmp_buf( jmp_buf jmp );
+ 
++/* Traxis (patches/0009): on macOS, setjmp saves the signal mask and the
++ * signal stack state with two system calls, which cost more than the reads
++ * and writes whose buffers __TRY checks. The fault handler jumps back only
++ * after returning from the signal, which already restores both, so the
++ * plain _setjmp is enough. */
++#ifdef __APPLE__
++#define __wine_unix_setjmp(buf) _setjmp(buf)
++#else
++#define __wine_unix_setjmp(buf) setjmp(buf)
++#endif
++
+ #define __TRY \
+     do { jmp_buf __jmp; \
+          int __first = 1; \
+@@ -63,7 +74,7 @@
+              ntdll_set_exception_jmp_buf( NULL ); \
+              break; \
+          } else { \
+-             if (setjmp( __jmp )) { \
++             if (__wine_unix_setjmp( __jmp )) { \
+                  do {
+ 
+ #define __ENDTRY \
+--- a/dlls/ntdll/unix/signal_x86_64.c
++++ b/dlls/ntdll/unix/signal_x86_64.c
+@@ -2331,7 +2331,13 @@
+         TRACE_(seh)( "returning to handler\n" );
+         RDI_sig(sigcontext) = (ULONG_PTR)ntdll_get_thread_data()->jmp_buf;
+         RSI_sig(sigcontext) = 1;
++#ifdef __APPLE__
++        /* Traxis (patches/0009): returning from the signal restores the mask
++         * and the signal stack state; __TRY's _setjmp didn't save them */
++        RIP_sig(sigcontext) = (ULONG_PTR)_longjmp;
++#else
+         RIP_sig(sigcontext) = (ULONG_PTR)longjmp;
++#endif
+         ntdll_get_thread_data()->jmp_buf = NULL;
+     }
+     else

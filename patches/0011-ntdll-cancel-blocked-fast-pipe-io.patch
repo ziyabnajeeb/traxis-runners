@@ -1,0 +1,191 @@
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5774,6 +5774,106 @@
+ 
+     return !NtQueryInformationFile( handle, &iosb, &info, sizeof(info), FilePipeInformation ) &&
+            info.CompletionMode == FILE_PIPE_COMPLETE_OPERATION;
++}
++
++/* Traxis (patches/0011): a thread waiting in fast_pipe_wait, which
++ * CancelSynchronousIo and CancelIoEx find here: the I/O doesn't go through
++ * the server, so the server's cancel can't reach it. */
++struct fast_pipe_waiter
++{
++    struct list      entry;
++    HANDLE           tid;
++    HANDLE           handle;
++    IO_STATUS_BLOCK *io;
++    int              wake_fd;
++    BOOL             cancelled;
++};
++
++static struct list fast_pipe_waiters = LIST_INIT( fast_pipe_waiters );
++static pthread_mutex_t fast_pipe_mutex = PTHREAD_MUTEX_INITIALIZER;
++static __thread int fast_pipe_wake[2] = { -1, -1 };
++static __thread struct fast_pipe_waiter *fast_pipe_current;  /* while in the list */
++
++/* Waits until `fd` is ready for `events`, or the I/O is cancelled. */
++static NTSTATUS fast_pipe_wait( HANDLE handle, IO_STATUS_BLOCK *io, int fd, short events )
++{
++    struct fast_pipe_waiter waiter;
++    struct pollfd pfd[2] = { { fd, events, 0 }, { -1, POLLIN, 0 } };
++    sigset_t sigset;
++    char byte;
++
++    if (fast_pipe_wake[0] == -1 && pipe( fast_pipe_wake ) != -1)
++    {
++        fcntl( fast_pipe_wake[0], F_SETFL, O_NONBLOCK );
++        fcntl( fast_pipe_wake[1], F_SETFL, O_NONBLOCK );
++        fcntl( fast_pipe_wake[0], F_SETFD, FD_CLOEXEC );
++        fcntl( fast_pipe_wake[1], F_SETFD, FD_CLOEXEC );
++    }
++    if (fast_pipe_wake[0] == -1)
++    {
++        poll( pfd, 1, -1 );
++        return STATUS_SUCCESS;
++    }
++
++    waiter.tid       = NtCurrentTeb()->ClientId.UniqueThread;
++    waiter.handle    = handle;
++    waiter.io        = io;
++    waiter.wake_fd   = fast_pipe_wake[1];
++    waiter.cancelled = FALSE;
++    server_enter_uninterrupted_section( &fast_pipe_mutex, &sigset );
++    list_add_tail( &fast_pipe_waiters, &waiter.entry );
++    fast_pipe_current = &waiter;
++    server_leave_uninterrupted_section( &fast_pipe_mutex, &sigset );
++
++    pfd[1].fd = fast_pipe_wake[0];
++    poll( pfd, 2, -1 );
++
++    server_enter_uninterrupted_section( &fast_pipe_mutex, &sigset );
++    list_remove( &waiter.entry );
++    fast_pipe_current = NULL;
++    server_leave_uninterrupted_section( &fast_pipe_mutex, &sigset );
++    while (read( fast_pipe_wake[0], &byte, 1 ) > 0) ;
++    return waiter.cancelled ? STATUS_CANCELLED : STATUS_SUCCESS;
++}
++
++/* Cancels the fast pipe I/O that thread `tid` (any thread if 0) waits for on
++ * `handle` (any handle if 0), only the one with `io` if given. */
++static BOOL fast_pipe_cancel( HANDLE tid, HANDLE handle, IO_STATUS_BLOCK *io )
++{
++    struct fast_pipe_waiter *waiter;
++    sigset_t sigset;
++    BOOL found = FALSE;
++
++    server_enter_uninterrupted_section( &fast_pipe_mutex, &sigset );
++    LIST_FOR_EACH_ENTRY( waiter, &fast_pipe_waiters, struct fast_pipe_waiter, entry )
++    {
++        if ((tid && waiter->tid != tid) || (handle && waiter->handle != handle)) continue;
++        if (io && waiter->io != io) continue;
++        waiter->cancelled = TRUE;
++        write( waiter->wake_fd, "", 1 );
++        found = TRUE;
++    }
++    server_leave_uninterrupted_section( &fast_pipe_mutex, &sigset );
++    return found;
++}
++
++/* Cleans up when the calling thread exits, also if it was terminated while
++ * waiting. */
++void fast_pipe_exit_thread(void)
++{
++    sigset_t sigset;
++
++    if (fast_pipe_current)
++    {
++        server_enter_uninterrupted_section( &fast_pipe_mutex, &sigset );
++        list_remove( &fast_pipe_current->entry );
++        fast_pipe_current = NULL;
++        server_leave_uninterrupted_section( &fast_pipe_mutex, &sigset );
++    }
++    if (fast_pipe_wake[0] == -1) return;
++    close( fast_pipe_wake[0] );
++    close( fast_pipe_wake[1] );
++    fast_pipe_wake[0] = fast_pipe_wake[1] = -1;
+ }
+ 
+ /* Traxis (patches/0008): read a pipe backed by a socket pair directly.
+@@ -5808,8 +5908,6 @@
+         if (errno == EINTR) continue;
+         if (errno == EAGAIN)
+         {
+-            struct pollfd pfd = { fd, POLLIN, 0 };
+-
+             if (!checked_mode)
+             {
+                 checked_mode = TRUE;
+@@ -5819,7 +5917,7 @@
+                     break;
+                 }
+             }
+-            poll( &pfd, 1, -1 );
++            if ((status = fast_pipe_wait( handle, io, fd, POLLIN ))) break;
+             continue;
+         }
+         status = errno == EFAULT ? STATUS_ACCESS_VIOLATION : errno_to_status( errno );
+@@ -5855,14 +5953,12 @@
+         if (errno == EINTR) continue;
+         if (errno == EAGAIN)
+         {
+-            struct pollfd pfd = { fd, POLLOUT, 0 };
+-
+             if (!checked_mode)
+             {
+                 checked_mode = TRUE;
+                 if (fast_pipe_is_nowait( handle )) break;
+             }
+-            poll( &pfd, 1, -1 );
++            if ((status = fast_pipe_wait( handle, io, fd, POLLOUT ))) break;
+             continue;
+         }
+         /* the reading end is closed, as STATUS_PIPE_CLOSING from the server */
+@@ -7028,6 +7124,9 @@
+     {
+         return status;
+     }
++    /* Traxis (patches/0011): another thread's I/O on a fast pipe */
++    if ((!status || status == STATUS_NOT_FOUND) && !only_thread && fast_pipe_cancel( 0, handle, io ))
++        status = STATUS_SUCCESS;
+ 
+     io_status->Status = status;
+     io_status->Information = 0;
+@@ -7074,6 +7173,17 @@
+         status = wine_server_call( req );
+     }
+     SERVER_END_REQ;
++
++    /* Traxis (patches/0011): the thread may wait on a fast pipe instead */
++    if (status == STATUS_NOT_FOUND)
++    {
++        THREAD_BASIC_INFORMATION info;
++
++        if (!NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL ) &&
++            info.ClientId.UniqueProcess == NtCurrentTeb()->ClientId.UniqueProcess &&
++            fast_pipe_cancel( info.ClientId.UniqueThread, 0, io ))
++            status = STATUS_SUCCESS;
++    }
+ 
+     io_status->Status = status;
+     io_status->Information = 0;
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1110,6 +1110,7 @@
+     close( ntdll_get_thread_data()->reply_fd );
+     close( ntdll_get_thread_data()->request_fd );
+     server_exit_thread();
++    fast_pipe_exit_thread();
+ 
+ #if defined(__APPLE__) && defined(__x86_64__)
+     /* Remove the PEB from the localtime field in %gs, or MacOS might try
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -249,6 +249,7 @@
+ extern void server_init_process_done(void);
+ extern void server_init_thread( void *entry_point, BOOL *suspend );
+ extern void server_exit_thread(void);
++extern void fast_pipe_exit_thread(void);
+ extern int server_pipe( int fd[2] );
+ 
+ extern void fpux_to_fpu( I386_FLOATING_SAVE_AREA *fpu, const XSAVE_FORMAT *fpux );

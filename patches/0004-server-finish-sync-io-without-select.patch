@@ -1,0 +1,88 @@
+--- a/server/async.c
++++ b/server/async.c
+@@ -492,6 +492,32 @@
+     async->initial_status = async->iosb->status;
+     set_error( async->iosb->status );
+     return async->wait_handle;
++}
++
++/* Traxis (patches/0004): like async_handoff(), but I/O that completed at once
++ * on a synchronous handle, with no event, APC or completion port to notify,
++ * is finished here and no wait handle is returned. That saves the client a
++ * select request that would only do this; pipes read and written in small
++ * pieces (installers' unpacking helpers) make tens of thousands of these a
++ * second. Only for requests whose client then fills in the IOSB itself
++ * (ntdll's server_read_file and server_write_file). */
++obj_handle_t async_handoff_direct( struct async *async, data_size_t *result, int force_blocking )
++{
++    obj_handle_t handle = async_handoff( async, result, force_blocking );
++    unsigned int status = get_error();
++
++    if (handle && status != STATUS_PENDING && !NT_ERROR( status ) && async->blocking &&
++        async->direct_result && async->terminated && !async->unknown_status &&
++        !async->event && !async->data.apc && !async->data.apc_context)
++    {
++        async_set_result( &async->obj, async->iosb->status, async->iosb->result );
++        async->direct_result = 0;
++        close_handle( async->thread->process, async->wait_handle );
++        async->wait_handle = 0;
++        set_error( status );
++        return 0;
++    }
++    return handle;
+ }
+ 
+ /* complete a request-based async with a pre-allocated buffer */
+--- a/server/file.h
++++ b/server/file.h
+@@ -257,6 +257,7 @@
+ extern struct async *create_request_async( struct fd *fd, unsigned int comp_flags, const struct async_data *data,
+                                            int is_system );
+ extern obj_handle_t async_handoff( struct async *async, data_size_t *result, int force_blocking );
++extern obj_handle_t async_handoff_direct( struct async *async, data_size_t *result, int force_blocking );
+ extern void queue_async( struct async_queue *queue, struct async *async );
+ extern void async_set_timeout( struct async *async, timeout_t timeout, unsigned int status );
+ extern void async_set_result( struct object *obj, unsigned int status, apc_param_t total );
+--- a/server/fd.c
++++ b/server/fd.c
+@@ -3140,7 +3140,7 @@
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+         fd->fd_ops->read( fd, async, req->pos );
+-        reply->wait = async_handoff( async, NULL, 0 );
++        reply->wait = async_handoff_direct( async, NULL, 0 );
+         reply->options = fd->options;
+         release_object( async );
+     }
+@@ -3158,7 +3158,7 @@
+     if ((async = create_request_async( fd, fd->comp_flags, &req->async, 0 )))
+     {
+         fd->fd_ops->write( fd, async, req->pos );
+-        reply->wait = async_handoff( async, &reply->size, 0 );
++        reply->wait = async_handoff_direct( async, &reply->size, 0 );
+         reply->options = fd->options;
+         release_object( async );
+     }
+--- a/dlls/ntdll/unix/file.c
++++ b/dlls/ntdll/unix/file.c
+@@ -5693,7 +5693,9 @@
+         status = virtual_locked_server_call( req );
+         wait_handle = wine_server_ptr_handle( reply->wait );
+         options     = reply->options;
+-        if (wait_handle && status != STATUS_PENDING)
++        /* Traxis (patches/0004): the server finishes I/O that completed at
++         * once without a wait handle; the IOSB is still ours to fill in. */
++        if (status != STATUS_PENDING && (wait_handle || !NT_ERROR( status )))
+             set_sync_iosb( io, status, wine_server_reply_size( reply ), options );
+     }
+     SERVER_END_REQ;
+@@ -5728,7 +5730,8 @@
+         status = wine_server_call( req );
+         wait_handle = wine_server_ptr_handle( reply->wait );
+         options     = reply->options;
+-        if (wait_handle && status != STATUS_PENDING)
++        /* Traxis (patches/0004): see server_read_file. */
++        if (status != STATUS_PENDING && (wait_handle || !NT_ERROR( status )))
+             set_sync_iosb( io, status, reply->size, options );
+     }
+     SERVER_END_REQ;
