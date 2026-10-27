@@ -1,0 +1,370 @@
+--- a/dlls/winebus.sys/bus_xbox360.c
++++ b/dlls/winebus.sys/bus_xbox360.c
+@@ -119,8 +119,16 @@
+     CFRunLoopSourceRef source;
+ 
+     char buffer[64];
++
++    /* Traxis (patches/0013): Xbox One and later wired pads speak Microsoft's
++     * GIP protocol; they are HID gamepads with haptics built by hid.c, so
++     * XInput's vibration reaches them. */
++    BOOL gip;
++    UInt8 in_pipe, out_pipe, gip_seq;
+ };
+ 
++static BOOL sequoia_or_later(void);
++
+ static inline struct xbox_device *impl_from_unix_device(struct unix_device *iface)
+ {
+     return CONTAINING_RECORD(iface, struct xbox_device, unix_device);
+@@ -282,12 +290,9 @@
+     return STATUS_SUCCESS;
+ }
+ 
+-static void ReadCompletion(void *refCon, IOReturn result, void *arg0)
++/* Turns an Xbox 360 input report into this bus's HID report and queues it. */
++static void queue_360_report(struct unix_device *device, IN_REPORT *report)
+ {
+-    struct unix_device *device = (struct unix_device *)refCon;
+-    struct xbox_device *private = impl_from_unix_device(device);
+-    IN_REPORT *report = (IN_REPORT*)private->buffer;
+-    UInt32 numBytesRead = (UINT_PTR)arg0;
+     int hatswitch;
+ 
+     /* Invert Y axis */
+@@ -321,10 +326,161 @@
+     report->buttons |= hatswitch;
+ 
+     bus_event_queue_input_report(&event_queue, device, (BYTE *)report, FIELD_OFFSET(IN_REPORT, reserved));
++}
++
++/* Traxis (patches/0013): GIP, as the Linux xpad driver documents it. */
++enum { GIP_ACK = 0x01, GIP_POWER = 0x05, GIP_GUIDE = 0x07, GIP_RUMBLE = 0x09, GIP_INPUT = 0x20 };
++#define GIP_OPT_ACK      0x10
++#define GIP_OPT_INTERNAL 0x20
++
++/* Wired pads that speak GIP (Bluetooth models never reach this USB bus). */
++static BOOL is_gip_gamepad(WORD vid, WORD pid)
++{
++    return vid == 0x045e && (pid == 0x02d1 || pid == 0x02dd || pid == 0x02e3 || pid == 0x02ea ||
++                             pid == 0x0b00 || pid == 0x0b12);
++}
++
++/* The next sequence number: they start at 1, and the pad ignores a power-on
++ * numbered 0. */
++static UInt8 gip_next_seq(struct xbox_device *impl)
++{
++    if (!++impl->gip_seq) impl->gip_seq = 1;
++    return impl->gip_seq;
++}
++
++static void gip_send(struct xbox_device *impl, const UInt8 *data, UInt32 size)
++{
++    IOReturn ret = (*impl->interface)->WritePipe(impl->interface, impl->out_pipe, (void *)data, size);
++    if (ret != kIOReturnSuccess) WARN("write failed, %#x\n", ret);
++}
++
++/* Wakes the pad: it sends nothing until told to power on. The One S and
++ * Elite 2 also need their own start packet. */
++static void gip_start(struct xbox_device *impl, WORD pid)
++{
++    UInt8 power_on[] = {GIP_POWER, GIP_OPT_INTERNAL, gip_next_seq(impl), 0x01, 0x00};
++    UInt8 s_init[] = {GIP_POWER, GIP_OPT_INTERNAL, gip_next_seq(impl), 0x0f, 0x06};
++
++    gip_send(impl, power_on, sizeof(power_on));
++    if (pid == 0x02ea || pid == 0x0b00) gip_send(impl, s_init, sizeof(s_init));
++}
++
++/* Buttons as hid_device_add_gamepad numbers them (the SDL bus's order). */
++enum { PAD_A, PAD_B, PAD_X, PAD_Y, PAD_LB, PAD_RB, PAD_BACK, PAD_START, PAD_LS, PAD_RS,
++       PAD_UP, PAD_RIGHT, PAD_DOWN, PAD_LEFT, PAD_GUIDE = 16 };
++
++static void gip_read(struct unix_device *device, const UInt8 *data, UInt32 size)
++{
++    struct xbox_device *impl = impl_from_unix_device(device);
++    struct hid_device_state *state = &device->hid_device_state;
++
++    if (size >= 18 && data[0] == GIP_INPUT)
++    {
++        /* GIP: byte 4 menu, view, A, B, X, Y in bits 2-7; byte 5 d-pad up,
++         * down, left, right, LB, RB, stick clicks; triggers 0-1023 at 6 and
++         * 8; sticks at 10-16 with Y up, as XInput has them. */
++        static const struct { BYTE byte, mask, button; } map[] =
++        {
++            {4, 0x04, PAD_START}, {4, 0x08, PAD_BACK}, {4, 0x10, PAD_A}, {4, 0x20, PAD_B},
++            {4, 0x40, PAD_X}, {4, 0x80, PAD_Y}, {5, 0x01, PAD_UP}, {5, 0x02, PAD_DOWN},
++            {5, 0x04, PAD_LEFT}, {5, 0x08, PAD_RIGHT}, {5, 0x10, PAD_LB}, {5, 0x20, PAD_RB},
++            {5, 0x40, PAD_LS}, {5, 0x80, PAD_RS},
++        };
++        unsigned int i;
++
++        for (i = 0; i < ARRAY_SIZE(map); i++)
++            hid_device_set_button(device, map[i].button, data[map[i].byte] & map[i].mask);
++        hid_device_set_hatswitch_x(device, 0, !!(data[5] & 0x08) - !!(data[5] & 0x04));
++        hid_device_set_hatswitch_y(device, 0, !!(data[5] & 0x02) - !!(data[5] & 0x01));
++        hid_device_set_abs_axis(device, 0, (SHORT)(data[10] | data[11] << 8));
++        hid_device_set_abs_axis(device, 1, (SHORT)(data[12] | data[13] << 8));
++        hid_device_set_abs_axis(device, 2, (SHORT)(data[14] | data[15] << 8));
++        hid_device_set_abs_axis(device, 3, (SHORT)(data[16] | data[17] << 8));
++        /* triggers: 0-1023 to the descriptor's 0-32767 */
++        hid_device_set_abs_axis(device, 4, (data[6] | data[7] << 8) * 32);
++        hid_device_set_abs_axis(device, 5, (data[8] | data[9] << 8) * 32);
++    }
++    else if (size >= 5 && data[0] == GIP_GUIDE)
++    {
++        /* The pad repeats this report until it is acknowledged, and then
++         * stops reporting the button. */
++        if (data[1] == (GIP_OPT_ACK | GIP_OPT_INTERNAL))
++        {
++            UInt8 ack[] = {GIP_ACK, GIP_OPT_INTERNAL, data[2], 0x09, 0x00, GIP_GUIDE,
++                           GIP_OPT_INTERNAL, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00};
++            gip_send(impl, ack, sizeof(ack));
++        }
++        hid_device_set_button(device, PAD_GUIDE, data[4] & 0x03);
++    }
++    else return;
++
++    bus_event_queue_input_report(&event_queue, device, state->report_buf, state->report_len);
++}
++
++/* XInput's vibration: grips (rumble = the heavy left motor, buzz = the
++ * light right one) and the trigger motors, 0-65535 each, to GIP's 0-100. */
++static NTSTATUS gip_device_haptics_start(struct unix_device *iface, UINT duration_ms,
++                                         USHORT rumble_intensity, USHORT buzz_intensity,
++                                         USHORT left_intensity, USHORT right_intensity)
++{
++    struct xbox_device *impl = impl_from_unix_device(iface);
++    UInt8 packet[] = {GIP_RUMBLE, 0x00, gip_next_seq(impl), 0x09, 0x00, 0x0f,
++                      left_intensity * 100 / 65535, right_intensity * 100 / 65535,
++                      rumble_intensity * 100 / 65535, buzz_intensity * 100 / 65535,
++                      0xff, 0x00, 0xff};
++
++    TRACE("iface %p, duration_ms %u, rumble %u, buzz %u, left %u, right %u.\n", iface, duration_ms,
++          rumble_intensity, buzz_intensity, left_intensity, right_intensity);
++    if (!impl->interface) return STATUS_DEVICE_NOT_READY;
++    gip_send(impl, packet, sizeof(packet));
++    return STATUS_SUCCESS;
++}
++
++static NTSTATUS gip_device_haptics_stop(struct unix_device *iface)
++{
++    return gip_device_haptics_start(iface, 0, 0, 0, 0, 0);
++}
++
++static NTSTATUS gip_device_physical_device_control(struct unix_device *iface, USAGE control)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS gip_device_physical_device_set_gain(struct unix_device *iface, BYTE percent)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static NTSTATUS gip_device_physical_effect_control(struct unix_device *iface, BYTE index,
++                                                   USAGE control, BYTE iterations)
++{
++    return STATUS_NOT_SUPPORTED;
++}
+ 
++static NTSTATUS gip_device_physical_effect_update(struct unix_device *iface, BYTE index,
++                                                  struct effect_params *params)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++static void ReadCompletion(void *refCon, IOReturn result, void *arg0)
++{
++    struct unix_device *device = (struct unix_device *)refCon;
++    struct xbox_device *private = impl_from_unix_device(device);
++    UInt32 numBytesRead = (UINT_PTR)arg0;
++
++    if (private->gip)
++    {
++        TRACE("GIP read result %#x, %u bytes, type %#x\n", result, (unsigned)numBytesRead,
++              (UInt8)private->buffer[0]);
++        if (result == kIOReturnSuccess) gip_read(device, (UInt8 *)private->buffer, numBytesRead);
++    }
++    else
++        queue_360_report(device, (IN_REPORT *)private->buffer);
++
+     numBytesRead = sizeof(private->buffer) - 1;
+ 
+-    (*private->interface)->ReadPipeAsync(private->interface, 1,
++    (*private->interface)->ReadPipeAsync(private->interface, private->gip ? private->in_pipe : 1,
+                             private->buffer, numBytesRead, ReadCompletion,
+                             device);
+ }
+@@ -404,7 +560,10 @@
+ 
+     ret = (*private->dev)->USBDeviceOpen(private->dev);
+     if (ret != kIOReturnSuccess)
++    {
++        ERR("Can't open the controller (%#x): in use by another program?\n", ret);
+         return STATUS_UNSUCCESSFUL;
++    }
+ 
+     ret = (*private->dev)->SetConfiguration(private->dev, desc->bConfigurationValue);
+     if (ret != kIOReturnSuccess)
+@@ -413,10 +572,20 @@
+         return STATUS_UNSUCCESSFUL;
+     }
+ 
+-    /* XBox 360 */
+-    intf.bInterfaceClass=kIOUSBFindInterfaceDontCare;
+-    intf.bInterfaceSubClass=93;
+-    intf.bInterfaceProtocol=1;
++    if (private->gip)
++    {
++        /* GIP's data interface (vendor class, subclass 0x47, protocol 0xd0) */
++        intf.bInterfaceClass=0xff;
++        intf.bInterfaceSubClass=0x47;
++        intf.bInterfaceProtocol=0xd0;
++    }
++    else
++    {
++        /* XBox 360 */
++        intf.bInterfaceClass=kIOUSBFindInterfaceDontCare;
++        intf.bInterfaceSubClass=93;
++        intf.bInterfaceProtocol=1;
++    }
+     intf.bAlternateSetting=kIOUSBFindInterfaceDontCare;
+ 
+     ret = (*private->dev)->CreateInterfaceIterator(private->dev, &intf, &iter);
+@@ -446,7 +615,10 @@
+ 
+     ret = (*private->interface)->USBInterfaceOpen(private->interface);
+     if (ret != kIOReturnSuccess)
++    {
++        ERR("Can't open the controller's interface, %#x\n", ret);
+         return STATUS_UNSUCCESSFUL;
++    }
+ 
+     ret = (*private->interface)->CreateInterfaceAsyncEventSource(private->interface, &private->source);
+     if (ret != kIOReturnSuccess)
+@@ -454,9 +626,34 @@
+ 
+     CFRunLoopAddSource(run_loop, private->source, kCFRunLoopCommonModes);
+ 
++    if (private->gip)
++    {
++        UInt8 count, pipe, direction, number, type, interval;
++        UInt16 size;
++        WORD pid;
++
++        (*private->interface)->GetNumEndpoints(private->interface, &count);
++        for (pipe = 1; pipe <= count; pipe++)
++        {
++            (*private->interface)->GetPipeProperties(private->interface, pipe, &direction,
++                                                     &number, &type, &size, &interval);
++            if (type != kUSBInterrupt) continue;
++            if (direction == kUSBIn && !private->in_pipe) private->in_pipe = pipe;
++            if (direction == kUSBOut && !private->out_pipe) private->out_pipe = pipe;
++        }
++        if (!private->in_pipe || !private->out_pipe)
++        {
++            ERR("No interrupt pipes on the GIP interface\n");
++            return STATUS_UNSUCCESSFUL;
++        }
++        (*private->dev)->GetDeviceProduct(private->dev, &pid);
++        TRACE("GIP pad %04x: pipes in %u, out %u\n", pid, private->in_pipe, private->out_pipe);
++        gip_start(private, pid);
++    }
++
+     /* Start event queue */
+     numBytesRead = sizeof(private->buffer) - 1;
+-    ret = (*private->interface)->ReadPipeAsync(private->interface, 1,
++    ret = (*private->interface)->ReadPipeAsync(private->interface, private->gip ? private->in_pipe : 1,
+                             private->buffer, numBytesRead, ReadCompletion,
+                             iface);
+     if (ret != kIOReturnSuccess)
+@@ -501,6 +698,31 @@
+     xbox_device_set_feature_report,
+ };
+ 
++/* Traxis (patches/0013) */
++static const struct hid_device_vtbl gip_device_vtbl =
++{
++    xbox_device_destroy,
++    xbox_device_start,
++    xbox_device_stop,
++    gip_device_haptics_start,
++    gip_device_haptics_stop,
++    gip_device_physical_device_control,
++    gip_device_physical_device_set_gain,
++    gip_device_physical_effect_control,
++    gip_device_physical_effect_update,
++};
++
++/* A gamepad as XInput expects one, with grip and trigger haptics. */
++static BOOL gip_build_report_descriptor(struct unix_device *iface)
++{
++    static const USAGE_AND_PAGE device_usage = {.UsagePage = HID_USAGE_PAGE_GENERIC,
++                                                .Usage = HID_USAGE_GENERIC_GAMEPAD};
++
++    return hid_device_begin_report_descriptor(iface, &device_usage) &&
++           hid_device_add_gamepad(iface) && hid_device_add_haptics(iface) &&
++           hid_device_end_report_descriptor(iface);
++}
++
+ static void process_IOService_Device(io_object_t object)
+ {
+     struct device_desc desc =
+@@ -560,8 +782,26 @@
+         TRACE("Not an xbox gamepad\n");
+         goto failed;
+     }
++    /* In Sequoia and later, GameController.framework supports wired XBOX 360
++     * controllers, but not wired Xbox One ones (Traxis, patches/0013). */
++    if (!is_gip_gamepad(vid, pid) && sequoia_or_later())
++    {
++        TRACE("Left to macOS: XBOX 360 controller on Sequoia or later\n");
++        goto failed;
++    }
+ 
+-    if (!(impl = raw_device_create(&xbox_device_vtbl, sizeof(struct xbox_device)))) goto failed;
++    if (is_gip_gamepad(vid, pid))
++    {
++        if (!(impl = hid_device_create(&gip_device_vtbl, sizeof(struct xbox_device)))) goto failed;
++        if (!gip_build_report_descriptor(&impl->unix_device))
++        {
++            ERR("Can't describe the GIP pad\n");
++            free(impl);
++            goto failed;
++        }
++        impl->gip = TRUE;
++    }
++    else if (!(impl = raw_device_create(&xbox_device_vtbl, sizeof(struct xbox_device)))) goto failed;
+     list_add_tail(&device_list, &impl->unix_device.entry);
+     impl->object = object;
+     impl->dev = dev;
+@@ -623,13 +863,8 @@
+ 
+     TRACE("args %p\n", args);
+ 
+-    /* In Sequoia and later, GameController.framework supports wired XBOX 360 controllers */
+-    if (sequoia_or_later())
+-    {
+-        TRACE("disabled: running on macOS Sequoia or later\n");
+-        return STATUS_SUCCESS;
+-    }
+-
++    /* Traxis (patches/0013): stays on in Sequoia and later for wired Xbox One
++     * controllers; XBOX 360 ones are left to macOS there (process_IOService_Device). */
+     options = *(struct xbox_bus_options *)args;
+ 
+     run_loop = CFRunLoopGetCurrent();
+@@ -666,13 +901,6 @@
+     /* cleanup previously returned event */
+     bus_event_cleanup(result);
+ 
+-    /* In Sequoia and later, GameController.framework supports wired XBOX 360 controllers */
+-    if (sequoia_or_later())
+-    {
+-        TRACE("disabled: running on macOS Sequoia or later\n");
+-        return STATUS_SUCCESS;
+-    }
+-
+     do
+     {
+         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;

@@ -5,7 +5,7 @@ Traxis downloads these itself and checks each file against a SHA-256 checksum bu
 
 | Runner | Archive SHA-256 |
 |---|---|
-| `cx-26.3.0-r3` | `75b6ec3baf2b50e05ff20c0c6e425ce5d90c9946513dae813aa008f340920c0e` |
+| `cx-26.3.0-r4` | `5f3d83e14b3cf9fa54e669f65b2e9b6fc982591cb26d29f9f1ec3668489997b9` |
 
 ## Sources (LGPL)
 
