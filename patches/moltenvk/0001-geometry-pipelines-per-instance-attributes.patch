@@ -1,0 +1,13 @@
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -2205,6 +2205,10 @@
+             si.shaderVar.vecsize = vertexFormatInfo[pVKVA->format].num_elements;
+             si.shaderVar.normalized = vertexFormatInfo[pVKVA->format].normalized;
+             si.shaderVar.binding = getDevice()->getMetalBufferIndexForVertexAttributeBinding(pVKVA->binding);
++            // The object function loads attributes itself; per-instance ones
++            // advance with the instance.
++            if (pVKVB->inputRate == VK_VERTEX_INPUT_RATE_INSTANCE)
++                si.shaderVar.rate = MSL_SHADER_VARIABLE_RATE_PER_INSTANCE;
+         }
+ 
+         si.binding = pVKVA->binding;

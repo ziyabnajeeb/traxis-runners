@@ -5,7 +5,7 @@ Traxis downloads these itself and checks each file against a SHA-256 checksum bu
 
 | Runner | Archive SHA-256 |
 |---|---|
-| `cx-26.3.0-r4` | `5f3d83e14b3cf9fa54e669f65b2e9b6fc982591cb26d29f9f1ec3668489997b9` |
+| `cx-26.3.0-r5` | `9354e617782bd8020bc6af19c09ed4d538cee2684f109e4b0ab2ad5187a4e62d` |
 
 ## Sources (LGPL)
 
@@ -33,6 +33,17 @@ Wine is licensed under the GNU LGPL 2.1 or later. Each runner is built from:
   - gst-plugins-ugly 1.24.12: https://gstreamer.freedesktop.org/src/gst-plugins-ugly/gst-plugins-ugly-1.24.12.tar.xz (SHA-256 `19ed6eef4ea1a742234fb35e2cdb107168595a4dd409a9fac0b7a16543eee78b`)
   - gst-libav 1.24.12: https://gstreamer.freedesktop.org/src/gst-libav/gst-libav-1.24.12.tar.xz (SHA-256 `ef72c1c70a17b3c0bb283d16d09aba496d3401c927dcf5392a8a7866d9336379`)
   - FFmpeg 7.1.1: https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz (SHA-256 `733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1`)
+- MoltenVK (Apache 2.0) and its SPIRV-Cross (Apache 2.0), from the CrossOver source archive
+  (`moltenvk/`), with the patches in [`patches/moltenvk/`](patches/moltenvk/) and
+  [`patches/spirv-cross/`](patches/spirv-cross/). Built with Xcode; its build fetches, at the
+  revisions pinned in `moltenvk/ExternalRevisions`:
+  - Vulkan-Headers (Apache 2.0): https://github.com/KhronosGroup/Vulkan-Headers at `fc6c06ac529e4b4b6e34c17cc650a8f62dee2eb0`
+  - glslang (BSD and others): https://github.com/KhronosGroup/glslang at `fa9c3deb49e035a8abcabe366f26aac010f6cbfb`
+  - Vulkan-Tools (Apache 2.0): https://github.com/KhronosGroup/Vulkan-Tools at `b47676a03827fc0c287409b243b1fd62886e79c0`
+  - Volk (MIT): https://github.com/zeux/volk at `466085407d5d2f50583fd663c1d65f93a7709d3e`
+  - cereal (BSD): https://github.com/USCiLab/cereal at `51cbda5f30e56c801c07fe3d3aba5d7fb9e6cca4`
+- DXVK v1.10.3 (zlib), from the CrossOver source archive (`dxvk/`), with the patches in
+  [`patches/dxvk/`](patches/dxvk/); its shaders compiled by glslang (above).
 - Bundled add-ons, from WineHQ (https://dl.winehq.org/wine/):
 - wine-gecko-2.47.4-x86.msi
 - wine-gecko-2.47.4-x86_64.msi

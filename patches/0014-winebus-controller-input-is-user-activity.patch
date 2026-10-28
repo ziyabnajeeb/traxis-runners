@@ -1,0 +1,69 @@
+--- a/dlls/winebus.sys/bus_xbox360.c	2026-10-28 16:50:17
++++ b/dlls/winebus.sys/bus_xbox360.c	2026-10-28 16:50:24
+@@ -25,6 +25,7 @@
+ 
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <time.h>
+ 
+ #if defined(HAVE_IOKIT_USB_IOUSBLIB_H)
+ #define DWORD UInt32
+@@ -56,6 +57,7 @@
+ #include <IOKit/IOKitLib.h>
+ #include <IOKit/IOCFPlugIn.h>
+ #include <IOKit/usb/IOUSBLib.h>
++#include <IOKit/pwr_mgt/IOPMLib.h>
+ #undef ULONG
+ #undef E_INVALIDARG
+ #undef E_OUTOFMEMORY
+@@ -368,6 +370,31 @@
+ /* Buttons as hid_device_add_gamepad numbers them (the SDL bus's order). */
+ enum { PAD_A, PAD_B, PAD_X, PAD_Y, PAD_LB, PAD_RB, PAD_BACK, PAD_START, PAD_LS, PAD_RS,
+        PAD_UP, PAD_RIGHT, PAD_DOWN, PAD_LEFT, PAD_GUIDE = 16 };
++
++/* Tells macOS someone is using the Mac, as the keyboard and trackpad do, so
++ * the display doesn't dim while the pad is played: macOS doesn't see input
++ * read straight from a USB device. Only real use counts (a button, a trigger
++ * pulled, a stick moved past its jitter), at most every few seconds. */
++static void gip_declare_activity(const UInt8 *data)
++{
++    static UInt8 last[18];
++    static IOPMAssertionID assertion = kIOPMNullAssertionID;
++    static time_t declared;
++    time_t now = time(NULL);
++    unsigned int i;
++    BOOL used = data[4] != last[4] || data[5] != last[5];
++
++    for (i = 6; i < 10 && !used; i += 2)
++        used = abs((data[i] | data[i + 1] << 8) - (last[i] | last[i + 1] << 8)) > 64;
++    for (i = 10; i < 18 && !used; i += 2)
++        used = abs((SHORT)(data[i] | data[i + 1] << 8) - (SHORT)(last[i] | last[i + 1] << 8)) > 4096;
++    if (!used) return;
++    memcpy(last, data, sizeof(last));
++    if (now - declared < 5) return;
++    declared = now;
++    IOPMAssertionDeclareUserActivity(CFSTR("Wine: game controller in use"), kIOPMUserActiveLocal,
++                                     &assertion);
++}
+ 
+ static void gip_read(struct unix_device *device, const UInt8 *data, UInt32 size)
+ {
+@@ -399,6 +426,7 @@
+         /* triggers: 0-1023 to the descriptor's 0-32767 */
+         hid_device_set_abs_axis(device, 4, (data[6] | data[7] << 8) * 32);
+         hid_device_set_abs_axis(device, 5, (data[8] | data[9] << 8) * 32);
++        gip_declare_activity(data);
+     }
+     else if (size >= 5 && data[0] == GIP_GUIDE)
+     {
+@@ -747,7 +775,9 @@
+ 
+     if ((kIOReturnSuccess != err) || (plugInInterface == nil) )
+     {
+-        ERR("Unable to create plug in interface for USB device\n");
++        /* Most USB devices (keyboards, cameras, hubs) belong to other
++         * drivers and can't be opened here; that's normal, not an error. */
++        TRACE("can't open USB device %#x (%#x)\n", object, err);
+         goto failed;
+     }
+ 

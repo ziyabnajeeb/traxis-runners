@@ -1,0 +1,38 @@
+--- a/spirv_msl.cpp	2026-10-28 17:15:38
++++ b/spirv_msl.cpp	2026-10-28 17:15:38
+@@ -1886,17 +1886,11 @@
+ 		{
+ 			need_comma = true;
+ 			statement(to_name(stage_in_var_id));
+-		}
+-
+-		auto resources = get_sorted_entry_point_args(false);
+-
+-		for (auto &resource : resources)
+-		{
+-			statement(need_comma ? ", " : "", resource.name);
+-			need_comma = true;
+ 		}
+ 
+-
++		// The vertex function takes its argument buffers before its other
++		// resources (entry_point_args_argument_buffer comes first), so pass
++		// them in that order too.
+ 		if (msl_options.argument_buffers)
+ 		{
+ 			for (uint32_t i = 0; i < kMaxArgumentBuffers; i++)
+@@ -1909,6 +1903,14 @@
+ 				need_comma = true;
+ 			}
+ 		}
++
++		auto resources = get_sorted_entry_point_args(false);
++
++		for (auto &resource : resources)
++		{
++			statement(need_comma ? ", " : "", resource.name);
++			need_comma = true;
++		}
+ 		ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var)
+ 		{
+ 			if (var.storage == StorageClassInput && is_builtin_variable(var))

@@ -1,0 +1,45 @@
+--- a/spirv_msl.hpp	2026-10-28 20:29:52
++++ b/spirv_msl.hpp	2026-10-28 20:23:04
+@@ -72,6 +72,9 @@
+ 	MSL_SHADER_VARIABLE_RATE_PER_VERTEX = 0,
+ 	MSL_SHADER_VARIABLE_RATE_PER_PRIMITIVE = 1,
+ 	MSL_SHADER_VARIABLE_RATE_PER_PATCH = 2,
++	// A vertex attribute that advances per instance (emulated geometry
++	// shaders load vertex attributes themselves).
++	MSL_SHADER_VARIABLE_RATE_PER_INSTANCE = 3,
+ 
+ 	MSL_SHADER_VARIABLE_RATE_INT_MAX = 0x7fffffff,
+ };
+--- a/spirv_msl.cpp	2026-10-28 20:29:52
++++ b/spirv_msl.cpp	2026-10-28 20:23:16
+@@ -1797,14 +1797,14 @@
+ 		}
+ 		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::Triangles)
+ 		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("if (drawInfo->topoStrip) startingIndex *= 3;");
++			// A list: each triangle has its own three vertices. (The pipeline's
++			// topology picks this branch; drawInfo->topoStrip isn't needed.)
++			statement("int startingIndex = positionInGrid.x * 3;");
+ 			statement("int vertexCount = 3;");
+ 		}
+ 		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::Lines)
+ 		{
+-			statement("int startingIndex = positionInGrid.x;");
+-			statement("if (drawInfo->topoStrip) startingIndex *= 2;");
++			statement("int startingIndex = positionInGrid.x * 2;");
+ 			statement("int vertexCount = 2;");
+ 		}
+ 		else if (msl_options.input_primitive_type == Options::PrimitiveTopology::LineStrip)
+@@ -1896,7 +1896,10 @@
+ 			std::string type_name = get_variable_format_string(variable.format);
+ 			std::string component = type_name + get_vertex_loader_component_suffix(load_elements);
+ 			std::string packed = variable.vecsize > 1 ? "packed_" : "";
+-			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + vertexIndex * " + std::to_string(variable.stride) + ")";
++			// Per-instance attributes advance with the instance, not the vertex
++			// (reading them per vertex runs past the end of their buffer).
++			std::string element = variable.rate == MSL_SHADER_VARIABLE_RATE_PER_INSTANCE ? "instanceIndex" : "vertexIndex";
++			std::string load_string = "*(device " + packed + component + " *)(vb" + std::to_string(variable.binding) + " + " + std::to_string(variable.offset) + " + " + element + " * " + std::to_string(variable.stride) + ")";
+ 			if (load_elements != parent_type.vecsize)
+ 			{
+ 				component = type_name + get_vertex_loader_component_suffix(parent_type.vecsize);

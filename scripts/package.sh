@@ -42,6 +42,24 @@ env = { WINEDLLPATH_PREPEND = "{runner}/lib/dxmt", DXMT_LOG_PATH = "none" }
 TOML
 fi
 
+# DXVK (build-wine.sh dxvk): D3D9/10/11 on Vulkan, which MoltenVK runs on
+# Metal. For games DXMT doesn't run; a bottle chooses it (D3D9 games get
+# it too, since its d3d9.dll is in the same folder).
+if [ -d "$DIST/lib/dxvk" ]; then
+  cat >> "$DIST/runner.toml" <<'TOML'
+
+[[components]]
+id = "dxvk"
+kind = "graphics"
+provides = ["d3d9", "d3d10", "d3d11"]
+
+[components.activate]
+# Searched before Wine's own d3d9/d3d11/dxgi (patches/0002). Logs go to
+# stderr, as with DXMT; warnings and errors only, not every device detail.
+env = { WINEDLLPATH_PREPEND = "{runner}/lib/dxvk", DXVK_LOG_PATH = "none", DXVK_LOG_LEVEL = "warn" }
+TOML
+fi
+
 # Wine's own headers are only needed to build Winelib apps.
 rm -rf "$DIST/include"
 

@@ -17,3 +17,6 @@ GST_PLUGIN_SYSTEM_PATH_1_0 = "{runner}/lib/gstreamer-1.0"
 GST_PLUGIN_PATH_1_0 = ""
 GST_PLUGIN_SCANNER_1_0 = "{runner}/libexec/gstreamer-1.0/gst-plugin-scanner"
 GST_REGISTRY_1_0 = "{runner}/lib/gstreamer-1.0/registry.bin"
+# MoltenVK (Vulkan on Metal) logs every device it creates and destroys;
+# errors only, so games' logs stay readable.
+MVK_CONFIG_LOG_LEVEL = "1"

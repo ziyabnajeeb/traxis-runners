@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build Wine from the CodeWeavers sources into runners/build/ (git-ignored).
-# Usage: runners/scripts/build-wine.sh [deps|gstreamer|source|configure|build|install|addons|components|all]   (default: all)
+# Usage: runners/scripts/build-wine.sh [deps|gstreamer|vulkan|source|configure|build|install|addons|components|dxvk|all]   (default: all)
 # Requires runners/scripts/toolchain.sh to have run once.
 set -eu
 # Build natively, even when started from a shell running under Rosetta: Apple's
@@ -258,6 +258,56 @@ deps_ffmpeg() {
 # what Wine loads by name or links (FreeType, GnuTLS, winegstreamer's
 # GStreamer libraries) and GStreamer's plugins, plus all they link in turn.
 # Prints their file names.
+# MoltenVK (Vulkan on Metal), from the archive's moltenvk/: Wine's
+# winevulkan loads it at runtime, and DXVK and vkd3d run on it. Needs full
+# Xcode (see docs/xcode-commands.md) and the network once: its own
+# fetchDependencies clones the Khronos libraries at the revisions pinned in
+# ExternalRevisions. SPIRV-Cross comes from the archive instead, because the
+# script would look for it next to the git repo it sits in (ours), with
+# patches/spirv-cross/ applied (and patches/moltenvk/ to MoltenVK). Kept out
+# of $DEPS/lib so pointing configure at it changes nothing else.
+MOLTENVK=$RUNNERS/build/deps-moltenvk
+deps_moltenvk() {
+  src=$RUNNERS/build/src/moltenvk
+  built=$src/Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+  if [ ! -f "$built" ]; then
+    rm -rf "$src" "$RUNNERS/build/src/spirv-cross"
+    cp -R "$CX_SRC/moltenvk" "$src"
+    for p in "$RUNNERS"/patches/moltenvk/*.patch; do
+      echo "applying moltenvk/$(basename "$p")"
+      patch -d "$src" -p1 --forward --quiet < "$p"
+    done
+    mv "$src/External/SPIRV-Cross" "$RUNNERS/build/src/spirv-cross"
+    for p in "$RUNNERS"/patches/spirv-cross/*.patch; do
+      echo "applying spirv-cross/$(basename "$p")"
+      patch -d "$RUNNERS/build/src/spirv-cross" -p1 --forward --quiet < "$p"
+    done
+    log=$RUNNERS/build/moltenvk.log
+    echo "building MoltenVK (log: $log)"
+    if ! (cd "$src" && unset CC CXX OBJC &&
+      ./fetchDependencies --macos --spirv-cross-root "$RUNNERS/build/src/spirv-cross" &&
+      make macos) >"$log" 2>&1; then
+      tail -20 "$log" >&2
+      exit 1
+    fi
+  fi
+  mkdir -p "$MOLTENVK/lib"
+  # Runners are x86_64 (Apple Silicon runs them under Rosetta).
+  lipo -thin x86_64 "$built" -output "$MOLTENVK/lib/libMoltenVK.dylib"
+  install_name_tool -id "$MOLTENVK/lib/libMoltenVK.dylib" "$MOLTENVK/lib/libMoltenVK.dylib"
+  # Xcode signed it; the changes above break that, and macOS refuses to
+  # load a library with a broken signature. Sign it again (ad hoc).
+  codesign -f -s - "$MOLTENVK/lib/libMoltenVK.dylib"
+}
+bundle_moltenvk() {
+  out=$DIST/lib/libMoltenVK.dylib
+  mkdir -p "$DIST/lib"
+  cp "$MOLTENVK/lib/libMoltenVK.dylib" "$out" && chmod u+w "$out"
+  install_name_tool -id "@loader_path/libMoltenVK.dylib" "$out"
+  codesign -f -s - "$out"
+  echo "bundled libMoltenVK.dylib"
+}
+
 needed_libs() {
   todo="$DEPS/lib/libfreetype.6.dylib $DEPS/lib/libgnutls.30.dylib"
   for lib in $(PKG_CONFIG_PATH=$DEPS/lib/pkgconfig pkg-config --libs-only-l $GST_WINE_PACKAGES); do
@@ -329,7 +379,7 @@ relink() { # <file> <to>
 
 deps() {
   deps_freetype && deps_gnutls && deps_glib && deps_gstreamer && deps_ffmpeg &&
-    bundle_libs && bundle_gstreamer
+    deps_moltenvk && bundle_libs && bundle_gstreamer && bundle_moltenvk
 }
 
 
@@ -344,6 +394,79 @@ patch_source() {
   done
 }
 
+# DXVK (D3D9/10/11 on Vulkan, so on MoltenVK), from the archive's dxvk/:
+# 1.10.3, the last line that runs on MoltenVK's Vulkan 1.2. Built for both
+# Windows architectures with llvm-mingw, from a copy with patches/dxvk/
+# applied. Its shaders are compiled by glslangValidator, built here from
+# the glslang that deps_moltenvk fetched (cmake from the toolchain).
+dxvk() {
+  src=$RUNNERS/build/src/dxvk
+  rm -rf "$src" && cp -R "$CX_SRC/dxvk" "$src"
+  for p in "$RUNNERS"/patches/dxvk/*.patch; do
+    echo "applying dxvk/$(basename "$p")"
+    patch -d "$src" -p1 --forward --quiet < "$p"
+  done
+  glslang=$RUNNERS/build/glslang-host
+  if [ ! -x "$glslang/bin/glslangValidator" ]; then
+    [ -d "$RUNNERS/build/src/moltenvk/External/glslang" ] || deps_moltenvk
+    (unset CC CXX OBJC &&
+      cmake -S "$RUNNERS/build/src/moltenvk/External/glslang" -B "$glslang" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DENABLE_OPT=OFF -DGLSLANG_TESTS=OFF \
+        -DGLSLANG_ENABLE_INSTALL=OFF -DBUILD_SHARED_LIBS=OFF >/dev/null &&
+      ninja -C "$glslang" glslang-standalone >/dev/null)
+    # DXVK 1.10 looks for glslang's old name.
+    mkdir -p "$glslang/bin" && ln -sf ../StandAlone/glslang "$glslang/bin/glslangValidator"
+  fi
+  rm -rf "$DIST/lib/dxvk"
+  for arch in x86_64 i386; do
+    case $arch in
+      x86_64) triple=x86_64-w64-mingw32 family=x86_64 cpu=x86_64 ;;
+      i386) triple=i686-w64-mingw32 family=x86 cpu=i686 ;;
+    esac
+    out=$RUNNERS/build/dxvk/$arch
+    mkdir -p "$RUNNERS/build/dxvk"
+    cat > "$RUNNERS/build/dxvk/cross-$arch.txt" <<CROSS
+[binaries]
+c = '$triple-clang'
+cpp = '$triple-clang++'
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+windres = '$triple-windres'
+
+[properties]
+needs_exe_wrapper = true
+
+[host_machine]
+system = 'windows'
+cpu_family = '$family'
+cpu = '$cpu'
+endian = 'little'
+
+[built-in options]
+# DXVK 1.10.3 uses std::transform without <algorithm>, which older C++
+# libraries included indirectly.
+cpp_args = ['-include', 'algorithm']
+CROSS
+    log=$RUNNERS/build/dxvk/$arch.log
+    echo "building DXVK $arch (log: $log)"
+    if ! (unset CC CXX OBJC && export PATH="$glslang/bin:$PATH" &&
+      { [ -f "$out/build.ninja" ] || meson setup "$out" "$src" --buildtype release \
+          --cross-file "$RUNNERS/build/dxvk/cross-$arch.txt"; } &&
+      meson setup --reconfigure "$out" "$src" >/dev/null && ninja -C "$out") >"$log" 2>&1; then
+      tail -20 "$log" >&2
+      exit 1
+    fi
+    mkdir -p "$DIST/lib/dxvk/$arch-windows"
+    for dll in d3d9 d3d10 d3d10_1 d3d10core d3d11 dxgi; do
+      cp "$(find "$out/src" -name "$dll.dll" | head -1)" "$DIST/lib/dxvk/$arch-windows/"
+      # Wine only loads DLLs from its search path (patches/0002) if they are
+      # marked as Wine builtins, as DXMT's are; Proton marks DXVK the same way.
+      "$BUILD/tools/winebuild/winebuild" --builtin "$DIST/lib/dxvk/$arch-windows/$dll.dll"
+    done
+  done
+  echo "bundled DXVK $(sed -n "s/.*version : '\(v[^']*\)'.*/\1/p" "$src/meson.build")"
+}
+
 configure() {
   [ -d "$SRC" ] || patch_source
   mkdir -p "$BUILD"
@@ -355,7 +478,9 @@ configure() {
     GNUTLS_LIBS="-L$DEPS/lib -lgnutls" \
     GSTREAMER_CFLAGS="$(PKG_CONFIG_PATH=$DEPS/lib/pkgconfig pkg-config --cflags $GST_WINE_PACKAGES)" \
     GSTREAMER_LIBS="$(PKG_CONFIG_PATH=$DEPS/lib/pkgconfig pkg-config --libs $GST_WINE_PACKAGES)" \
+    LDFLAGS="-L$MOLTENVK/lib" \
     --prefix="$DIST" \
+    --with-vulkan \
     --host=x86_64-apple-darwin \
     --enable-archs=i386,x86_64 \
     --with-mingw=llvm-mingw \
@@ -439,13 +564,15 @@ components() {
 case $STEP in
   deps) deps ;;
   gstreamer) deps_glib && deps_gstreamer && deps_ffmpeg && bundle_libs && bundle_gstreamer ;;
-  bundle) bundle_libs && bundle_gstreamer ;;
+  vulkan) deps_moltenvk && bundle_moltenvk ;;
+  bundle) bundle_libs && bundle_gstreamer && bundle_moltenvk ;;
   source) patch_source ;;
   configure) shift || true; configure "$@" ;;
   build) build ;;
   install) install ;;
   addons) addons ;;
-  components) components ;;
-  all) deps && patch_source && configure && build && install && addons && components ;;
+  components) components && dxvk ;;
+  dxvk) dxvk ;;
+  all) deps && patch_source && configure && build && install && addons && components && dxvk ;;
   *) echo "unknown step: $STEP" >&2; exit 2 ;;
 esac

@@ -1,0 +1,341 @@
+--- a/spirv_msl.hpp	2026-10-28 18:21:24
++++ b/spirv_msl.hpp	2026-10-28 19:02:22
+@@ -1165,6 +1165,10 @@
+ 	uint32_t builtin_local_invocation_index_id = 0;
+ 	uint32_t builtin_workgroup_size_id = 0;
+ 	uint32_t msl_subgroup_size_id = 0;
++	// Geometry shaders emulated with mesh shaders: the mesh stream, as a
++	// variable so that functions which emit vertices get it as an argument.
++	uint32_t mesh_stream_var_id = 0;
++	uint32_t mesh_stream_type_id = 0;
+ 	uint32_t builtin_frag_depth_id = 0;
+ 	uint32_t swizzle_buffer_id = 0;
+ 	uint32_t buffer_size_buffer_id = 0;
+@@ -1210,6 +1214,9 @@
+ 	// Must be ordered to ensure declarations are in a specific order.
+ 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> inputs_by_location;
+ 	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> inputs_by_builtin;
++	// Every input as given, unmerged: inputs_by_location keys builtins by
++	// their location too, so one can hide a user location.
++	SmallVector<MSLShaderInterfaceVariable> all_shader_inputs;
+ 	std::map<LocationComponentPair, MSLShaderInterfaceVariable> outputs_by_location;
+ 	std::unordered_map<uint32_t, MSLShaderInterfaceVariable> outputs_by_builtin;
+ 	std::unordered_set<uint32_t> location_inputs_in_use;
+--- a/spirv_msl.cpp	2026-10-28 18:21:24
++++ b/spirv_msl.cpp	2026-10-28 19:20:35
+@@ -74,6 +74,7 @@
+ 
+ void CompilerMSL::add_msl_shader_input(const MSLShaderInterfaceVariable &si)
+ {
++	all_shader_inputs.push_back(si);
+ 	inputs_by_location[{si.location, si.component}] = si;
+ 	if (si.builtin != BuiltInMax && !inputs_by_builtin.count(si.builtin))
+ 		inputs_by_builtin[si.builtin] = si;
+@@ -1120,7 +1121,37 @@
+ 		xfb_buffer_id = var_id;
+ 		printf("xfb_buffer_id = %u\n", var_id);
+ 	}
++
++	// The mesh stream that emulated geometry shaders emit into is declared in
++	// the entry point; a variable for it lets extract_global_variables_from_function
++	// pass it to every function that emits vertices, as it does with other globals.
++	if (get_execution_model() == ExecutionModelGeometry && msl_options.for_mesh_pipeline && !mesh_stream_var_id)
++	{
++		uint32_t offset = ir.increase_bound_by(3);
++		uint32_t type_id = offset;
++		uint32_t ptr_type_id = offset + 1;
++		uint32_t var_id = offset + 2;
+ 
++		SPIRType stream_type(OpTypeStruct);
++		stream_type.basetype = SPIRType::Struct;
++		auto &type = set<SPIRType>(type_id, stream_type);
++		type.self = type_id;
++		set_name(type_id, "mesh_stream_t");
++
++		SPIRType stream_ptr_type = type;
++		stream_ptr_type.pointer = true;
++		stream_ptr_type.pointer_depth++;
++		stream_ptr_type.parent_type = type_id;
++		stream_ptr_type.storage = StorageClassPrivate;
++		auto &ptr_type = set<SPIRType>(ptr_type_id, stream_ptr_type);
++		ptr_type.self = type_id;
++
++		set<SPIRVariable>(var_id, ptr_type_id, StorageClassPrivate);
++		set_name(var_id, "meshStream");
++		mesh_stream_type_id = type_id;
++		mesh_stream_var_id = var_id;
++	}
++
+ 	if (needs_msl_subgroup_size)
+ 	{
+ 		if (builtin_subgroup_size_id && !msl_options.emulate_subgroups && msl_options.fixed_subgroup_size == 0)
+@@ -1954,32 +1985,60 @@
+ 	{
+ 		assert(execution.model == ExecutionModelGeometry);
+ 
+-		// Emit the payload struct
++		// The payload holds the vertex stage's output for each vertex, as
++		// the object function stores it (its main0_out). Lay it out the same
++		// way, from the previous stage's outputs: user locations by location
++		// and component, then builtins by type, as MemberSorter orders them.
++		// Not from this shader's inputs: it may read only some of them.
++		SmallVector<MSLShaderInterfaceVariable> vs_locations, vs_builtins;
++		for (auto &si : all_shader_inputs)
++			(si.builtin == BuiltInMax ? vs_locations : vs_builtins).push_back(si);
++		std::sort(vs_locations.begin(), vs_locations.end(), [](const MSLShaderInterfaceVariable &a, const MSLShaderInterfaceVariable &b) {
++			return a.location != b.location ? a.location < b.location : a.component < b.component;
++		});
++		std::sort(vs_builtins.begin(), vs_builtins.end(), [](const MSLShaderInterfaceVariable &a, const MSLShaderInterfaceVariable &b) {
++			return a.builtin < b.builtin;
++		});
++
++		auto format_type = [](const MSLShaderInterfaceVariable &si) -> string {
++			const char *base;
++			switch (si.format)
++			{
++			case MSL_SHADER_VARIABLE_FORMAT_UINT8: base = "uchar"; break;
++			case MSL_SHADER_VARIABLE_FORMAT_INT8: base = "char"; break;
++			case MSL_SHADER_VARIABLE_FORMAT_UINT16: case MSL_SHADER_VARIABLE_FORMAT_ANY16: base = "ushort"; break;
++			case MSL_SHADER_VARIABLE_FORMAT_INT16: base = "short"; break;
++			case MSL_SHADER_VARIABLE_FORMAT_HALF: base = "half"; break;
++			case MSL_SHADER_VARIABLE_FORMAT_UINT32: base = "uint"; break;
++			case MSL_SHADER_VARIABLE_FORMAT_INT32: base = "int"; break;
++			default: base = "float"; break;
++			}
++			uint32_t n = si.vecsize ? si.vecsize : 4;
++			return n > 1 ? join(base, n) : string(base);
++		};
++		auto location_member = [](const MSLShaderInterfaceVariable &si) {
++			return join("m_location_", si.location, "_", si.component);
++		};
++
+ 		statement("struct Payload");
+ 		begin_scope();
+ 		statement("struct");
+ 		begin_scope();
+-
+-		statement("struct ");
+-		begin_scope();
+-
+-		auto &ib_var = get<SPIRVariable>(stage_in_var_id);
+-		auto &ib_type = get_variable_data_type(ib_var);
+-
+-		msl_options.for_mesh_pipeline = false;
+-		int i = 0;
+-		for (auto &member : ib_type.member_types)
++		for (auto &si : vs_locations)
++			statement(format_type(si), " ", location_member(si), ";");
++		for (auto &si : vs_builtins)
+ 		{
+-			auto type = get<SPIRType>(member);
+-			auto parent = get<SPIRType>(type.parent_type);
+-			emit_struct_member(ib_type, type.parent_type, i);
+-			i++;
++			string name = CompilerGLSL::builtin_to_glsl(si.builtin, StorageClassGeneric);
++			if (si.builtin == BuiltInPosition)
++				statement("float4 ", name, ";");
++			else if (si.builtin == BuiltInClipDistance || si.builtin == BuiltInCullDistance)
++				statement("float ", name, "[", si.vecsize ? si.vecsize : 1, "];");
++			else
++				statement("float ", name, ";");
+ 		}
+-		msl_options.for_mesh_pipeline = true;
+ 
+ 		int vertex_count = get_primitive_vertex_count();
+ 
+-		end_scope_decl("in");
+ 		end_scope_decl(join("vertices[", std::to_string(vertex_count), "]"));
+ 		end_scope(";");
+ 
+@@ -2005,42 +2064,77 @@
+ 
+ 		begin_scope();
+ 
+-		auto in_var_type = get_variable_data_type(get<SPIRVariable>(stage_in_var_id));
+-		statement(type_to_glsl(in_var_type), " ", to_name(stage_in_var_id), ";");
++		auto &ib_var = get<SPIRVariable>(stage_in_var_id);
++		auto &ib_type = get_variable_data_type(ib_var);
++		string in_name = to_name(stage_in_var_id);
++		statement(type_to_glsl(ib_type), " ", in_name, " = {};");
+ 
+ 		statement("const unsigned long vertexCount = ", vertex_count,";");
+ 		statement("for (unsigned long i = 0; i < vertexCount; ++i)");
+ 		begin_scope();
+ 
+-		statement("auto out = payload.vertices[i];");
++		statement("auto v = payload.vertices[i];");
+ 
+-		ir.for_each_typed_id<SPIRVariable>([&](uint32_t id, SPIRVariable &var)
++		// Each input of this shader, from the vertex output it corresponds to.
++		for (uint32_t m = 0; m < uint32_t(ib_type.member_types.size()); m++)
+ 		{
+-			std::string name = to_name(id);
++			auto &mbr_type = get<SPIRType>(ib_type.member_types[m]);
++			auto &elem_type = get<SPIRType>(mbr_type.parent_type);
++			string mbr = join(in_name, ".", to_member_name(ib_type, m), "[i]");
+ 
+-			if (var.storage != StorageClassInput)
+-				return;
++			if (elem_type.basetype == SPIRType::Struct)
++			{
++				// gl_in: its builtin members.
++				for (uint32_t j = 0; j < uint32_t(elem_type.member_types.size()); j++)
++				{
++					BuiltIn builtin = BuiltInMax;
++					if (!is_member_builtin(elem_type, j, &builtin) || !inputs_by_builtin.count(builtin))
++						continue;
++					string name = CompilerGLSL::builtin_to_glsl(builtin, StorageClassGeneric);
++					auto &bi_type = get<SPIRType>(elem_type.member_types[j]);
++					if (bi_type.array.empty())
++						statement(mbr, ".", name, " = v.", name, ";");
++					else
++						statement("for (uint j = 0; j < ", to_array_size(bi_type, 0), "; j++) ", mbr, ".", name, "[j] = v.", name, "[j];");
++				}
++				continue;
++			}
+ 
+-			if (!interface_variable_exists_in_entry_point(var.self))
+-				return;
++			if (!has_member_decoration(ib_type.self, m, DecorationLocation))
++				continue;
++			uint32_t location = get_member_decoration(ib_type.self, m, DecorationLocation);
++			uint32_t component = get_member_decoration(ib_type.self, m, DecorationComponent);
++			auto it = std::find_if(vs_locations.begin(), vs_locations.end(), [&](const MSLShaderInterfaceVariable &si) {
++				return si.location == location && si.component == component;
++			});
++			if (it == vs_locations.end())
++				continue; // The vertex stage doesn't write it.
+ 
+-			if (is_hidden_variable(var, true))
+-				return;
++			// Same bits, possibly fewer or more components than the vertex wrote.
++			string value = join("v.", location_member(*it));
++			uint32_t written = it->vecsize ? it->vecsize : 4;
++			if (elem_type.vecsize < written)
++				value += string(".xyzw").substr(0, elem_type.vecsize + 1);
++			string elem = type_to_glsl(elem_type);
++			auto elem_base = elem_type;
++			elem_base.vecsize = std::min(elem_type.vecsize, written);
++			value = join("as_type<", type_to_glsl(elem_base), ">(", value, ")");
++			if (elem_type.vecsize > written)
++			{
++				value = join(elem, "(", value);
++				for (uint32_t c = written; c < elem_type.vecsize; c++)
++					value += ", 0";
++				value += ")";
++			}
++			statement(mbr, " = ", value, ";");
++		}
+ 
+-			statement("if (i < sizeof(", name, ") / sizeof(", name, "[0]))");
+-			statement("\t", name, "[i] = out.", name, ";");
+-		});
+-
+ 		end_scope();
+ 
+ 		statement(join(execution.name, "(outputMesh, ", to_name(stage_in_var_id)));
+ 
+-		auto resources = get_sorted_entry_point_args(false);
+-
+-		for (auto &resource : resources)
+-			statement(", ", resource.name);
+-
+-
++		// Argument buffers first, then the other resources: the order the
++		// geometry function declares them in (as for the vertex call above).
+ 		if (msl_options.argument_buffers)
+ 		{
+ 			for (uint32_t i = 0; i < kMaxArgumentBuffers; i++)
+@@ -2053,6 +2147,11 @@
+ 			}
+ 		}
+ 
++		auto resources = get_sorted_entry_point_args(false);
++
++		for (auto &resource : resources)
++			statement(", ", resource.name);
++
+ 		statement(");");
+ 		end_scope();
+ 	}
+@@ -2724,6 +2823,14 @@
+ 			case OpNot:
+ 				if (msl_options.bitwise_not_causes_ice)
+ 					added_arg_ids.insert(msl_subgroup_size_id);
++				break;
++
++			case OpEmitVertex:
++			case OpEndPrimitive:
++			case OpEmitStreamVertex:
++			case OpEndStreamPrimitive:
++				if (mesh_stream_var_id)
++					added_arg_ids.insert(mesh_stream_var_id);
+ 				break;
+ 
+ 			default:
+@@ -8464,6 +8571,19 @@
+ 			mark_scalar_layout_structs(type);
+ 	});
+ 
++	// Emulated geometry shaders keep gl_in as an array of its block (the
++	// payload holds one per vertex), so its type must be declared.
++	unordered_set<uint32_t> geometry_input_blocks;
++	if (get_execution_model() == ExecutionModelGeometry && msl_options.for_mesh_pipeline)
++	{
++		ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
++			auto &type = get_variable_data_type(var);
++			if (var.storage == StorageClassInput && type.basetype == SPIRType::Struct &&
++			    has_decoration(type.self, DecorationBlock) && is_builtin_type(type))
++				geometry_input_blocks.insert(type.self);
++		});
++	}
++
+ 	bool builtin_block_type_is_required = false;
+ 	// Very special case. If gl_PerVertex is initialized as an array (tessellation)
+ 	// we have to potentially emit the gl_PerVertex struct type so that we can emit a constant LUT.
+@@ -8592,8 +8712,13 @@
+ 			    has_decoration(type.self, DecorationBlock) || has_decoration(type.self, DecorationBufferBlock);
+ 
+ 			bool is_builtin_block = is_block && is_builtin_type(type);
+-			bool is_declarable_struct = is_struct && (!is_builtin_block || builtin_block_type_is_required);
++			bool is_declarable_struct = is_struct && (!is_builtin_block || builtin_block_type_is_required ||
++			                                          geometry_input_blocks.count(type_id));
+ 
++			// A placeholder for mesh_stream_t, which is declared with the stream.
++			if (type_id == mesh_stream_type_id)
++				is_declarable_struct = false;
++
+ 			// We'll declare this later.
+ 			if (stage_out_var_id && get_stage_out_struct_type().self == type_id)
+ 				is_declarable_struct = false;
+@@ -8619,6 +8744,19 @@
+ 
+ 				if (has_extended_decoration(type_id, SPIRVCrossDecorationBufferBlockRepacked))
+ 					align_struct(type, aligned_structs);
++
++				// Members of gl_in are read by their builtin names
++				// (gl_in[i].gl_Position), so declare them by those. Only now: the
++				// stage-in struct, built earlier, is named after the shader's names.
++				if (geometry_input_blocks.count(type_id))
++				{
++					for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
++					{
++						BuiltIn builtin = BuiltInMax;
++						if (is_member_builtin(type, i, &builtin))
++							set_member_name(type_id, i, CompilerGLSL::builtin_to_glsl(builtin, StorageClassGeneric));
++					}
++				}
+ 
+ 				// Make sure we declare the underlying struct type, and not the "decorated" type with pointers, etc.
+ 				emit_struct(get<SPIRType>(type_id));
+@@ -17498,6 +17636,10 @@
+ 	case BuiltInLayer:
+ 		if (is_tesc_shader())
+ 			break;
++		// A geometry shader reads these as members of its input blocks
++		// (gl_in[i].gl_Position): plain member names, not the output struct's.
++		if (get_execution_model() == ExecutionModelGeometry && storage == StorageClassGeneric)
++			return CompilerGLSL::builtin_to_glsl(builtin, storage);
+ 		if (storage != StorageClassInput && current_function && (current_function->self == ir.default_entry_point) &&
+ 		    !is_stage_output_builtin_masked(builtin))
+ 		{

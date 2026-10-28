@@ -24,6 +24,9 @@ PKGCONF=2.3.0
 PKGCONF_SHA256=3a9080ac51d03615e7c1910a0a2a8df08424892b5f13b0628a204d3fcce0ea8b
 NASM=2.16.03
 NASM_SHA256=1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148
+# cmake builds glslangValidator, which DXVK needs for its shaders (PyPI).
+CMAKE=3.31.6
+CMAKE_SHA256=da9d4fd9abd571fd016ddb27da0428b10277010b23bb21e3678f8b9e96e1686e
 
 fetch() { # <url> <sha256>
   file=$DL/$(basename "$1")
@@ -65,6 +68,12 @@ if [ ! -x "$ROOT/py/bin/meson" ]; then
   ninja_whl=$(fetch "https://files.pythonhosted.org/packages/py3/n/ninja/ninja-$NINJA-py3-none-macosx_10_9_universal2.whl" "$NINJA_SHA256")
   rm -rf "$ROOT/py" && python3 -m venv "$ROOT/py"
   "$ROOT/py/bin/pip" install -q --no-index --no-deps "$meson_whl" "$ninja_whl"
+fi
+
+if [ ! -x "$ROOT/py/bin/cmake" ]; then
+  echo "== cmake $CMAKE"
+  cmake_whl=$(fetch "https://files.pythonhosted.org/packages/7f/09/516b0d709672bc430eb13278f0316acd34869269447744f5d136daeef689/cmake-$CMAKE-py3-none-macosx_10_10_universal2.whl" "$CMAKE_SHA256")
+  "$ROOT/py/bin/pip" install -q --no-index --no-deps "$cmake_whl"
 fi
 
 # pkg-config, so Wine's configure finds GStreamer; nasm for FFmpeg's SIMD code.
